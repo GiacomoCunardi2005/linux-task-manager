@@ -23,6 +23,80 @@ class UITests(unittest.TestCase):
         cls.app.setStyle('Fusion')
         cls.app.setStyleSheet(STYLE)
 
+    def test_network_details_are_grouped_complete_and_fit_compact_windows(self):
+        import copy
+        from app import bitrate
+        window = Window()
+        window.show_page('performance')
+        window.show()
+        try:
+            wait(1200)
+            window.timer.stop()
+            window.sampler.wait()
+            self.app.processEvents()
+            data = copy.deepcopy(window.snapshot)
+            device = dict(identity='wifi-layout-fixture',wifi=True,connected=True,value=8000000,
+                sent=2000000,received=8000000,ipv4='192.0.2.10',
+                ipv6='2001:0db8:1234:5678:90ab:cdef:1234:5678',mac='02:00:00:00:00:01',
+                driver='driver-di-prova',mtu=1500,speed=1200,duplex='Full duplex',
+                link=dict(bus='USB',link_speed='5 Gbit/s'),ssid='Rete di laboratorio piano superiore',
+                standard='Wi-Fi 6 (802.11ax)',band='5 GHz',frequency='5320 MHz',channel='64',
+                width='80 MHz',signal='-48 dBm',rx_rate='1200.9 Mbit/s',tx_rate='1200.9 Mbit/s',
+                bssid='02:00:00:00:00:02')
+            data['nets'] = {'wlan-test':device}
+            window.receive(data)
+            window.select('nets','wlan-test')
+            names = ('Rete (SSID):','Standard Wi-Fi:','Banda:','Frequenza:','Canale:',
+                'Larghezza canale:','Segnale:','Bitrate RX (radio):','Bitrate TX (radio):',
+                'Nome scheda:','Tipo di connessione:','Driver:','MTU:','Collegamento USB:',
+                'Indirizzo IPv4:','Indirizzo IPv6:','Indirizzo MAC:','Punto di accesso:')
+            self.assertEqual(len(window.detail_labels),len(names))
+            for name in names:
+                self.assertIn(name,window.info_text)
+            self.assertEqual({heading.text() for heading in window.stats.findChildren(QWidget,'detail-heading')},
+                {'Collegamento Wi-Fi','Scheda di rete','Indirizzi'})
+            Path('reference').mkdir(exist_ok=True)
+            window.toggle_pause()
+            for width,height,expanded in ((1120,790,True),(900,660,False),(900,660,True)):
+                window.resize(width,height)
+                self.app.processEvents()
+                if (window.navigation.width()>100) != expanded:
+                    window.toggle_navigation()
+                self.app.processEvents()
+                wait(50)
+                self.app.processEvents()
+                scroll = window.findChild(QScrollArea,'detail-scroll')
+                self.assertLessEqual(scroll.widget().width(),scroll.viewport().width())
+                self.assertEqual(scroll.horizontalScrollBar().maximum(),0)
+                window.grab().save(f'reference/wifi-organized-{width}-{int(expanded)}.png')
+                for value in window.detail_labels:
+                    self.assertGreater(value.width(),35)
+                    if value.text() == device['ipv6']:
+                        self.assertGreaterEqual(value.width(),value.fontMetrics().horizontalAdvance(value.text()))
+                    self.assertGreaterEqual(value.height(),value.heightForWidth(value.width()),repr((value.text(),value.size(),value.sizeHint(),value.minimumSizeHint(),value.sizePolicy().hasHeightForWidth())))
+            window.toggle_pause()
+            # Refreshing values preserves the sections and the complete copy output.
+            device['sent'] = 4500000
+            device['ssid'] = 'Rete di prova aggiornata'
+            device['signal'] = None
+            window.receive(data)
+            self.assertEqual(window.value_labels[0].text(),bitrate(device['sent']))
+            self.assertIn(device['ssid'],[item.text() for item in window.detail_labels])
+            self.assertIn('Non disponibile',[item.text() for item in window.detail_labels])
+            window.copy_info()
+            self.assertIn('Punto di accesso:',QApplication.clipboard().text())
+            self.assertIn('Collegamento USB:',QApplication.clipboard().text())
+            # Ethernet retains negotiated speed, duplex and every interface field.
+            device['wifi'] = False
+            window.receive(data)
+            self.assertEqual(len(window.detail_labels),10)
+            for name in ('Velocità collegamento:','Duplex:','Nome scheda:','Driver:','MTU:',
+                         'Tipo di connessione:','Indirizzo IPv4:','Indirizzo IPv6:',
+                         'Indirizzo MAC:','Collegamento USB:'):
+                self.assertIn(name,window.info_text)
+        finally:
+            window.close()
+
     def test_resources_pause_cores_and_live_render(self):
         window = Window()
         window.show_page('performance')

@@ -6,12 +6,12 @@ from pathlib import Path
 import sys
 import time
 
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QRectF
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QRectF, QEvent
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QIcon, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QToolButton, QScrollArea, QFrame, QGridLayout, QMenu, QSizeGrip, QProgressBar, QStackedWidget,
-    QDialog, QFormLayout, QLineEdit, QSpinBox, QDialogButtonBox, QMessageBox)
+    QDialog, QFormLayout, QLineEdit, QSpinBox, QDialogButtonBox, QMessageBox, QSizePolicy, QLayout)
 from metrics import Monitor, read, size, percent, uptime
 from processes import ProcessPage
 from remote import RemoteMonitor, PORT
@@ -341,10 +341,15 @@ class Window(QWidget):
         self.composition.hide()
         self.composition_label.hide()
         self.stats = QWidget()
-        self.stats.setMinimumHeight(145)
-        self.stats_layout = QHBoxLayout(self.stats)
+        self.stats_reflow = QTimer(self)
+        self.stats_reflow.setSingleShot(True)
+        self.stats_reflow.timeout.connect(self.reflow_stats)
+        self.stats.installEventFilter(self)
+        self.stats_layout = QGridLayout(self.stats)
+        self.stats_layout.setSizeConstraint(QLayout.SetMinimumSize)
         self.stats_layout.setContentsMargins(0,8,0,0)
-        self.stats_layout.setSpacing(26)
+        self.stats_layout.setHorizontalSpacing(26)
+        self.stats_layout.setVerticalSpacing(20)
         self.detail_layout.addWidget(self.stats)
         self.notice = label('',10,'#bdbdbd')
         self.notice.setWordWrap(True)
@@ -627,6 +632,7 @@ class Window(QWidget):
         self.composition.setVisible(kind == 'memory')
         self.composition_label.setVisible(kind == 'memory')
         values, details = [], []
+        detail_columns = None
         self.scale.setText('100%')
         if kind == 'cpu':
             self.heading.setText('CPU')
@@ -671,18 +677,24 @@ class Window(QWidget):
             self.device.setText(key)
             self.chart_label.setText('Velocità effettiva')
             values = [('Invio',bitrate(d['sent'])),('Ricezione',bitrate(d['received']))]
-            details = [('Nome scheda:',key),('Tipo di connessione:','Wi-Fi' if d['wifi'] else 'Ethernet / virtuale'),
-                ('Velocità collegamento:',bitrate(d['speed']*1e6) if d['speed'] else 'Non disponibile'),
-                ('Duplex:',d['duplex'] or 'Non disponibile'),('MTU:',str(d['mtu']) if d['mtu'] else 'Non disponibile'),
-                ('Indirizzo IPv4:',d['ipv4']),('Indirizzo IPv6:',d['ipv6']),('Indirizzo MAC:',d['mac'] or 'Non disponibile'),
-                ('Driver:',d['driver'] or 'Non disponibile')]
+            adapter = [('Nome scheda:',key),('Tipo di connessione:','Wi-Fi' if d['wifi'] else 'Ethernet / virtuale'),
+                ('Driver:',d['driver'] or 'Non disponibile'),('MTU:',str(d['mtu']) if d['mtu'] else 'Non disponibile')]
+            addresses = [('Indirizzo IPv4:',d['ipv4']),('Indirizzo IPv6:',d['ipv6']),
+                ('Indirizzo MAC:',d['mac'] or 'Non disponibile')]
             if d['wifi']:
-                details = [(name,d.get(field) or 'Non disponibile') for name,field in (
+                connection = [(name,d.get(field) or 'Non disponibile') for name,field in (
                     ('Rete (SSID):','ssid'),('Standard Wi-Fi:','standard'),('Banda:','band'),('Frequenza:','frequency'),
                     ('Canale:','channel'),('Larghezza canale:','width'),('Segnale:','signal'),
-                    ('Bitrate RX (radio):','rx_rate'),('Bitrate TX (radio):','tx_rate'),('Punto di accesso:','bssid'))]+[item for item in details if item[0] not in ('Velocità collegamento:','Duplex:')]
+                    ('Bitrate RX (radio):','rx_rate'),('Bitrate TX (radio):','tx_rate'))]
+                addresses += [('Punto di accesso:',d.get('bssid') or 'Non disponibile')]
+            else:
+                connection = [('Velocità collegamento:',bitrate(d['speed']*1e6) if d['speed'] else 'Non disponibile'),
+                    ('Duplex:',d['duplex'] or 'Non disponibile')]
             if d['link']['bus'] == 'USB':
-                details += [('Collegamento USB:',d['link']['link_speed'] or 'Non disponibile')]
+                adapter += [('Collegamento USB:',d['link']['link_speed'] or 'Non disponibile')]
+            detail_columns = [[('Collegamento Wi-Fi' if d['wifi'] else 'Collegamento Ethernet',connection)],
+                [('Scheda di rete',adapter),('Indirizzi',addresses)]]
+            details = [item for column in detail_columns for _,items in column for item in items]
             self.notice.setText('Traffico effettivo: linea continua RX, tratteggiata TX. I bitrate radio e la velocità del collegamento non sono la velocità Internet.' if d['connected'] else 'Disconnesso')
         elif kind == 'npus':
             self.heading.setText(self.resources[(kind,key)].full_title)
@@ -728,11 +740,23 @@ class Window(QWidget):
                 graph.samples = list(self.histories[(f'gpu-{key}',name)])
                 graph.caption = name+' · '+percent(d['engines'].get(name))
             graph.update()
-        self.set_stats(values,details)
+        self.set_stats(values,details,detail_columns)
         self.info_text = self.heading.text()+' — '+self.device.text()+'\n'+'\n'.join(f'{k}: {v}' for k,v in values)+'\n'+'\n'.join(f'{k} {v}' for k,v in details)
 
-    def set_stats(self,values,details):
-        signature = tuple(k for k,_ in values), tuple(k for k,_ in details)
+    def eventFilter(self,watched,event):
+        if watched is getattr(self,'stats',None) and event.type() == QEvent.Resize and event.size().width() != event.oldSize().width():
+            self.stats_reflow.start(0)
+        return super().eventFilter(watched,event)
+
+    def reflow_stats(self):
+        if hasattr(self,'stats_content'):
+            self.set_stats(*self.stats_content)
+
+    def set_stats(self,values,details,detail_columns=None):
+        self.stats_content = values,details,detail_columns
+        wide = self.stats.width() >= 560
+        signature = (tuple(k for k,_ in values), tuple(k for k,_ in details),
+            tuple(tuple(title for title,_ in column) for column in detail_columns) if detail_columns else None,wide)
         if getattr(self,'stats_signature',None) == signature:
             for widget,(_,value) in zip(self.value_labels,values):
                 small = len(value) >= 17 or value == 'Non disponibile'
@@ -742,6 +766,7 @@ class Window(QWidget):
                 widget.setText(value)
             for widget,(_,value) in zip(self.detail_labels,details):
                 widget.setText(value)
+                widget.setToolTip(value)
             return
         self.stats_signature = signature
         self.value_labels, self.detail_labels = [], []
@@ -763,26 +788,74 @@ class Window(QWidget):
             value_label = label(value,20 if len(value)<17 and value != 'Non disponibile' else 14)
             self.value_labels.append(value_label)
             column.addWidget(value_label)
-            if self.selection[0] == 'cpu':
+            if detail_columns:
+                cell.setMinimumWidth(140)
+                grid.addWidget(cell,0,i)
+            elif self.selection[0] == 'cpu':
                 row, col, span = (0,i*3,3) if i < 2 else ((1,(i-2)*2,2) if i < 5 else (2,0,6))
                 grid.addWidget(cell,row,col,1,span)
             else:
                 grid.addWidget(cell,i//2,i%2)
         grid.setRowStretch((len(values)+1)//2,1)
-        self.stats_layout.addWidget(left)
+        if detail_columns:
+            grid.setColumnStretch(len(values),1)
+        self.stats_layout.addWidget(left,0,0,1,2 if detail_columns else 1)
         right = QWidget()
-        rows = QGridLayout(right)
-        rows.setContentsMargins(0,0,0,0)
-        rows.setHorizontalSpacing(16)
-        rows.setVerticalSpacing(3)
-        for i,(name,value) in enumerate(details):
-            rows.addWidget(label(name,11,'#cccccc'),i,0)
-            val = label(value,11)
-            val.setWordWrap(True)
-            self.detail_labels.append(val)
-            rows.addWidget(val,i,1)
-        rows.setRowStretch(len(details),1)
-        self.stats_layout.addWidget(right,1)
+        columns = QGridLayout(right)
+        columns.setContentsMargins(0,0,0,0)
+        columns.setHorizontalSpacing(24)
+        columns.setVerticalSpacing(20)
+        layouts = detail_columns or [[('',details)]]
+        for column_index,sections in enumerate(layouts):
+            container = QWidget()
+            groups = QVBoxLayout(container)
+            groups.setContentsMargins(0,0,0,0)
+            groups.setSpacing(20)
+            for title,items in sections:
+                section = QWidget()
+                section.setObjectName('detail-section')
+                group = QVBoxLayout(section)
+                group.setContentsMargins(0,0,0,0)
+                group.setSpacing(8)
+                if title:
+                    heading = label(title,12)
+                    heading.setObjectName('detail-heading')
+                    heading.setStyleSheet('font-size:12px; font-weight:600; color:#eeeeee;')
+                    group.addWidget(heading)
+                rows = QGridLayout()
+                rows.setContentsMargins(0,0,0,0)
+                rows.setHorizontalSpacing(12)
+                rows.setVerticalSpacing(4)
+                rows.setColumnStretch(1,1)
+                row = 0
+                for name,value in items:
+                    full_width = title == 'Indirizzi' and name == 'Indirizzo IPv6:'
+                    name_label = label(name,11,'#cccccc')
+                    name_label.setWordWrap(True)
+                    rows.addWidget(name_label,row,0,1,2 if full_width else 1,Qt.AlignTop)
+                    val = label(value,11)
+                    val.setWordWrap(True)
+                    policy = val.sizePolicy()
+                    policy.setHorizontalPolicy(QSizePolicy.Ignored)
+                    val.setSizePolicy(policy)
+                    val.setMinimumWidth(0)
+                    val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                    val.setToolTip(value)
+                    self.detail_labels.append(val)
+                    if full_width:
+                        rows.addWidget(val,row+1,0,1,2,Qt.AlignTop)
+                    else:
+                        rows.addWidget(val,row,1,Qt.AlignTop)
+                    row += 2 if full_width else 1
+                group.addLayout(rows)
+                groups.addWidget(section)
+            groups.addStretch()
+            columns.addWidget(container,0 if wide or not detail_columns else column_index,
+                column_index if wide or not detail_columns else 0)
+            columns.setColumnStretch(column_index if wide else 0,1)
+        self.stats_layout.addWidget(right,1 if detail_columns else 0,0 if detail_columns else 1,1,2 if detail_columns else 1)
+        self.stats_layout.setColumnStretch(0,1)
+        self.stats_layout.setColumnStretch(1,0 if detail_columns else 1)
 
     def copy_info(self):
         QApplication.clipboard().setText(getattr(self,'info_text','In attesa dei contatori'))
@@ -798,6 +871,7 @@ class Window(QWidget):
 
     def closeEvent(self,event):
         self.timer.stop()
+        self.stats_reflow.stop()
         self.sampler.wait()
         self.monitor.close()
         event.accept()
