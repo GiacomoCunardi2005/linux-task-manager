@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""Windows 11 inspired Processes and Performance views for Linux."""
+import argparse
+from collections import defaultdict, deque
+from pathlib import Path
+import sys
+import time
+
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QRectF
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QIcon, QPixmap
+from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
+    QPushButton, QToolButton, QScrollArea, QFrame, QGridLayout, QMenu, QSizeGrip, QProgressBar, QStackedWidget)
+from metrics import Monitor, read, size, percent, uptime
+from processes import ProcessPage
+
+COLORS = {'cpu':'#42a7bf', 'memory':'#8b8fd7', 'disks':'#9bc86b', 'nets':'#d48bbb', 'gpus':'#aa92d0'}
+ICON_PATHS = {
+ 'menu':'M4 6h16M4 12h16M4 18h16',
+ 'performance':'M3 3h18v18H3z M5 13h4l2-6 3 11 2-5h3',
+ 'processes':'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z',
+ 'history':'M4 6a9 9 0 1 1-1 9 M3 2v6h6 M12 6v6l4 2',
+ 'startup':'M4 16a8 8 0 0 1 16 0 M12 15l5-8 M6 17h1 M17 17h1',
+ 'users':'M9 4a3 3 0 1 1 0 6 3 3 0 0 1 0-6 M16 5a3 3 0 0 1 0 6 M3 20v-4a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v4z M17 13a4 4 0 0 1 4 4v3',
+ 'details':'M9 5h12M9 12h12M9 19h12 M3 5h1M3 12h1M3 19h1',
+ 'services':'M9 3h6l1 4 4 1v7l-4 1-1 5H9l-1-5-4-1V8l4-1z M12 9a3 3 0 1 1 0 6 3 3 0 0 1 0-6',
+ 'settings':'M9 3h6l1 4 4 1v7l-4 1-1 5H9l-1-5-4-1V8l4-1z M12 9a3 3 0 1 1 0 6 3 3 0 0 1 0-6',
+ 'pause':'M8 5v14M16 5v14', 'play':'M7 4l13 8-13 8z',
+ 'more':'M4 12h1M11 12h1M18 12h1', 'close':'M6 6l12 12M6 18L18 6',
+ 'max':'M5 5h14v14H5z', 'min':'M5 12h14', 'copy':'M8 7h12v14H8z M4 17V3h12',
+}
+
+
+def icon(name, color='#eeeeee'):
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="{ICON_PATHS[name]}" fill="none" stroke="{color}" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    pixmap = QPixmap(24,24)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    QSvgRenderer(svg.encode()).render(painter)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def label(text='', pixels=12, color='#eeeeee'):
+    widget = QLabel(text)
+    widget.setStyleSheet(f'color:{color}; font-size:{pixels}px; background:transparent;')
+    return widget
+
+
+class Graph(QWidget):
+    def __init__(self, color, mini=False):
+        super().__init__()
+        self.color, self.mini = QColor(color), mini
+        self.samples, self.secondary = [], []
+        self.maximum = 100
+        self.caption = None
+        self.setMinimumSize(60 if mini else 180, 42 if mini else 160)
+        self.setAccessibleName('Grafico degli ultimi 60 secondi')
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(.5, .5, self.width()-1, self.height()-1)
+        p.fillRect(rect, QColor('#202020' if self.mini else '#191919'))
+        p.setPen(QPen(QColor('#303030'), .7))
+        columns, rows = (3, 2) if self.mini else (15, 10)
+        for x in range(columns+1):
+            px = rect.left()+rect.width()*x/columns
+            p.drawLine(int(px), 0, int(px), self.height())
+        for y in range(rows+1):
+            py = rect.top()+rect.height()*y/rows
+            p.drawLine(0, int(py), self.width(), int(py))
+        if self.caption:
+            p.setPen(QColor('#cccccc'))
+            p.drawText(7,16,self.caption)
+        if not self.samples:
+            return
+        end = self.samples[-1][0]
+        for series, dashed in ((self.samples, False), (self.secondary, True)):
+            path = QPainterPath()
+            points = [(rect.right()-(end-t)/60*rect.width(), rect.bottom()-max(0,min(v/self.maximum,1))*rect.height()) for t,v in series if v is not None and end-t <= 60]
+            if not points:
+                continue
+            path.moveTo(*points[0])
+            for point in points[1:]:
+                path.lineTo(*point)
+            if not dashed:
+                area = QPainterPath(path)
+                area.lineTo(points[-1][0], rect.bottom())
+                area.lineTo(points[0][0], rect.bottom())
+                area.closeSubpath()
+                fill = QColor(self.color)
+                fill.setAlpha(175 if not self.mini else 120)
+                p.fillPath(area, fill)
+            pen = QPen(self.color, 1.3)
+            if dashed:
+                pen.setStyle(Qt.DashLine)
+            p.setPen(pen)
+            p.drawPath(path)
+        p.setPen(QPen(self.color if self.mini else QColor('#393939'), .7))
+        p.drawRect(rect)
+
+
+class Resource(QPushButton):
+    def __init__(self, title, color):
+        super().__init__()
+        self.setCheckable(True)
+        self.setFixedHeight(70)
+        self.setObjectName('resource')
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10,6,8,6)
+        row.setSpacing(10)
+        self.graph = Graph(color, True)
+        self.graph.setFixedSize(60,42)
+        row.addWidget(self.graph)
+        column = QVBoxLayout()
+        column.setSpacing(1)
+        self.full_title = title
+        self.title = label(title,15)
+        self.subtitle = label('',11)
+        self.subtitle.setWordWrap(False)
+        column.addWidget(self.title)
+        column.addWidget(self.subtitle)
+        row.addLayout(column,1)
+        # Child labels must not swallow the button's pointer events.
+        for child in (self.graph, self.title, self.subtitle):
+            child.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAccessibleName(title)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.title.setText(self.title.fontMetrics().elidedText(self.full_title, Qt.ElideRight, max(40,self.width()-88)))
+
+
+class Sampler(QThread):
+    ready = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, monitor):
+        super().__init__()
+        self.monitor = monitor
+
+    def run(self):
+        try:
+            self.ready.emit(self.monitor.sample())
+        except Exception as exc:
+            self.failed.emit(f'Impossibile leggere i contatori: {exc}')
+
+
+class TitleBar(QWidget):
+    def __init__(self, window):
+        super().__init__()
+        self.window = window
+        self.setFixedHeight(42)
+        self.setObjectName('titlebar')
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14,0,0,0)
+        menu = QToolButton()
+        menu.setIcon(icon('menu'))
+        menu.setToolTip('Espandi o riduci navigazione')
+        menu.clicked.connect(window.toggle_navigation)
+        row.addWidget(menu)
+        appicon = label()
+        appicon.setPixmap(icon('performance',COLORS['cpu']).pixmap(18,18))
+        row.addWidget(appicon)
+        row.addWidget(label('Gestione attività',12))
+        row.addStretch()
+        for name, title, action in [('min','Riduci a icona',window.showMinimized), ('max','Ingrandisci / ripristina',self.maximize), ('close','Chiudi',window.close)]:
+            button = QToolButton()
+            button.setIcon(icon(name))
+            button.setFixedSize(46,40)
+            button.setToolTip(title)
+            button.setAccessibleName(title)
+            button.clicked.connect(action)
+            if name == 'close':
+                button.setObjectName('close')
+            row.addWidget(button)
+        row.setSpacing(8)
+
+    def maximize(self):
+        self.window.showNormal() if self.window.isMaximized() else self.window.showMaximized()
+
+    def mousePressEvent(self,event):
+        if event.button() == Qt.LeftButton:
+            self.window.windowHandle().startSystemMove()
+
+    def mouseDoubleClickEvent(self,event):
+        if event.button() == Qt.LeftButton:
+            self.maximize()
+
+
+class Window(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.monitor = Monitor()
+        self.histories = defaultdict(lambda: deque(maxlen=65))
+        self.snapshot = None
+        self.selection = ('cpu','cpu')
+        self.paused = False
+        self.logical = False
+        self.setWindowTitle('Gestione attività — Processi Linux')
+        self.setWindowIcon(icon('performance',COLORS['cpu']))
+        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
+        self.resize(1120,790)
+        self.setMinimumSize(900,660)
+        self.setObjectName('window')
+        root = QVBoxLayout(self)
+        root.setContentsMargins(1,1,1,1)
+        root.setSpacing(0)
+        root.addWidget(TitleBar(self))
+        body = QHBoxLayout()
+        body.setSpacing(0)
+        root.addLayout(body,1)
+        self.navigation = QWidget()
+        self.navigation.setFixedWidth(240)
+        self.navigation.setObjectName('navigation')
+        nav = QVBoxLayout(self.navigation)
+        nav.setContentsMargins(4,4,6,10)
+        nav.setSpacing(4)
+        self.navbuttons = []
+        for key, text in [('processes','Processi'),('performance','Prestazioni')]:
+            button = QPushButton(text)
+            button.setIcon(icon(key))
+            button.setIconSize(QSize(20,20))
+            button.setFixedHeight(38)
+            button.setObjectName('nav')
+            button.setCheckable(True)
+            button.setChecked(key == 'processes')
+            button.clicked.connect(lambda checked=False,k=key: self.show_page(k))
+            nav.addWidget(button)
+            self.navbuttons.append((button,text))
+        nav.addStretch()
+        body.addWidget(self.navigation)
+        surface = QWidget()
+        surface.setObjectName('surface')
+        area = QVBoxLayout(surface)
+        area.setContentsMargins(0,0,0,0)
+        area.setSpacing(0)
+        toolbar = QWidget()
+        toolbar.setObjectName('toolbar')
+        toolbar.setFixedHeight(50)
+        tools = QHBoxLayout(toolbar)
+        tools.setContentsMargins(16,0,12,0)
+        title = label('Prestazioni',14)
+        title.setStyleSheet('font-weight:600; font-size:14px; background:transparent;')
+        tools.addWidget(title)
+        tools.addStretch()
+        self.pause = QPushButton('Sospendi')
+        self.pause.setIcon(icon('pause'))
+        self.pause.clicked.connect(self.toggle_pause)
+        tools.addWidget(self.pause)
+        more = QToolButton()
+        more.setIcon(icon('more'))
+        more.setToolTip('Opzioni di visualizzazione')
+        more.setAccessibleName('Opzioni di visualizzazione')
+        menu = QMenu(more)
+        self.core_action = menu.addAction('Mostra processori logici')
+        self.core_action.setCheckable(True)
+        self.core_action.toggled.connect(self.toggle_cores)
+        menu.addAction('Copia informazioni',self.copy_info)
+        menu.addAction('Informazioni',self.about)
+        more.setMenu(menu)
+        more.setPopupMode(QToolButton.InstantPopup)
+        tools.addWidget(more)
+        area.addWidget(toolbar)
+        content = QHBoxLayout()
+        content.setSpacing(0)
+        area.addLayout(content,1)
+        resource_scroll = QScrollArea()
+        resource_scroll.setWidgetResizable(True)
+        resource_scroll.setFixedWidth(210)
+        resource_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        resource_scroll.setObjectName('resources')
+        resources = QWidget()
+        resource_layout = QVBoxLayout(resources)
+        resource_layout.setContentsMargins(4,6,4,6)
+        resource_layout.setSpacing(0)
+        self.resources = {}
+        entries = [('cpu','cpu','CPU'),('memory','memory','Memoria')]
+        entries += [('disks',n,f'Disco {i} ({n})') for i,n in enumerate(self.monitor.disks)]
+        entries += [('nets',n,'Wi-Fi' if Path(f'/sys/class/net/{n}/wireless').exists() else 'Ethernet') for n in self.monitor.nets]
+        entries += [('gpus',str(i),f'GPU {i}') for i in range(len(self.monitor.gpus))]
+        for kind,key,title in entries:
+            resource = Resource(title,COLORS[kind])
+            resource.clicked.connect(lambda checked=False,k=kind,n=key: self.select(k,n))
+            resource_layout.addWidget(resource)
+            self.resources[(kind,key)] = resource
+        resource_layout.addStretch()
+        resource_scroll.setWidget(resources)
+        content.addWidget(resource_scroll)
+        detail_scroll = QScrollArea()
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setObjectName('detail-scroll')
+        detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        detail_scroll.setFrameShape(QFrame.NoFrame)
+        detail = QWidget()
+        self.detail_layout = QVBoxLayout(detail)
+        self.detail_layout.setContentsMargins(28,18,26,12)
+        self.detail_layout.setSpacing(5)
+        heading = QHBoxLayout()
+        self.heading = label('CPU',28)
+        self.device = label(self.monitor.cpu_name,14)
+        self.device.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.device.setWordWrap(True)
+        heading.addWidget(self.heading)
+        heading.addWidget(self.device,1)
+        self.detail_layout.addLayout(heading)
+        chart_labels = QHBoxLayout()
+        self.chart_label = label('% di utilizzo',11,'#cccccc')
+        self.scale = label('100%',11,'#cccccc')
+        chart_labels.addWidget(self.chart_label)
+        chart_labels.addStretch()
+        chart_labels.addWidget(self.scale)
+        self.detail_layout.addLayout(chart_labels)
+        self.chartbox = QWidget()
+        self.charts = QGridLayout(self.chartbox)
+        self.charts.setContentsMargins(0,0,0,0)
+        self.charts.setSpacing(5)
+        self.graphs = [Graph(COLORS['cpu'])]
+        self.charts.addWidget(self.graphs[0],0,0)
+        self.detail_layout.addWidget(self.chartbox,1)
+        axis = QHBoxLayout()
+        axis.addWidget(label('60 secondi',10,'#cccccc'))
+        axis.addStretch()
+        axis.addWidget(label('0',10,'#cccccc'))
+        self.detail_layout.addLayout(axis)
+        self.composition_label = label('Composizione memoria',11,'#cccccc')
+        self.detail_layout.addWidget(self.composition_label)
+        self.composition = QProgressBar()
+        self.composition.setRange(0,1000)
+        self.composition.setTextVisible(False)
+        self.composition.setFixedHeight(35)
+        self.composition.setStyleSheet('QProgressBar {border:1px solid #8b8fd7; background:#191919; border-radius:0;} QProgressBar::chunk {background:#5e6196;}')
+        self.detail_layout.addWidget(self.composition)
+        self.composition.hide()
+        self.composition_label.hide()
+        self.stats = QWidget()
+        self.stats.setMinimumHeight(145)
+        self.stats_layout = QHBoxLayout(self.stats)
+        self.stats_layout.setContentsMargins(0,8,0,0)
+        self.stats_layout.setSpacing(26)
+        self.detail_layout.addWidget(self.stats)
+        self.notice = label('',10,'#bdbdbd')
+        self.notice.setWordWrap(True)
+        self.detail_layout.addWidget(self.notice)
+        detail_scroll.setWidget(detail)
+        content.addWidget(detail_scroll,1)
+        self.pages = QStackedWidget()
+        self.process_page = ProcessPage(icon('processes'))
+        self.pages.addWidget(self.process_page)
+        self.pages.addWidget(surface)
+        self.pages.setCurrentIndex(0)
+        body.addWidget(self.pages,1)
+        grip = QSizeGrip(self)
+        grip.setFixedSize(14,14)
+        root.addWidget(grip,0,Qt.AlignRight)
+        self.sampler = Sampler(self.monitor)
+        self.sampler.ready.connect(self.receive)
+        self.sampler.failed.connect(self.show_error)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll)
+        self.timer.start(1000)
+        self.select('cpu','cpu')
+        self.poll()
+
+    def show_page(self,key):
+        self.pages.setCurrentIndex(0 if key == 'processes' else 1)
+        for button,text in self.navbuttons:
+            button.setChecked((text == 'Processi') == (key == 'processes'))
+        self.setWindowTitle('Gestione attività — '+('Processi' if key == 'processes' else 'Prestazioni')+' Linux')
+
+    def toggle_navigation(self):
+        collapsed = self.navigation.width() > 100
+        self.navigation.setFixedWidth(52 if collapsed else 240)
+        for button,text in self.navbuttons:
+            button.setText('' if collapsed else text)
+            button.setToolTip(text if collapsed else ('Questa versione comprende la scheda Prestazioni' if not button.isEnabled() else text))
+
+    def poll(self):
+        if not self.sampler.isRunning():
+            self.sampler.start()
+
+    def receive(self,data):
+        self.snapshot = data
+        self.process_page.receive(data)
+        now = time.monotonic()
+        for kind in ('cpu','memory'):
+            self.histories[(kind,kind)].append((now,data[kind]['value']))
+        for i,v in enumerate(data['cpu']['cores']):
+            self.histories[('core',str(i))].append((now,v))
+        for kind in ('disks','nets','gpus'):
+            for key,values in data[kind].items():
+                self.histories[(kind,key)].append((now,values['value']))
+                if kind == 'gpus':
+                    for engine,value in values['engines'].items():
+                        self.histories[(f'gpu-{key}',engine)].append((now,value))
+                if kind == 'disks':
+                    for field in ('read','write'):
+                        self.histories[(f'disk-{field}',key)].append((now,values[field]))
+                if kind == 'nets':
+                    for field in ('sent','received'):
+                        self.histories[(field,key)].append((now,values[field]))
+        if not self.paused:
+            self.render()
+
+    def show_error(self,error):
+        self.notice.setText(error+' — nuovo tentativo tra un secondo.')
+        self.process_page.status.setText(error+' — nuovo tentativo tra un secondo.')
+
+    def select(self,kind,key):
+        self.selection = (kind,key)
+        for pair,button in self.resources.items():
+            button.setChecked(pair == self.selection)
+        self.core_action.setEnabled(kind == 'cpu')
+        self.rebuild_graphs()
+        if self.snapshot:
+            self.render()
+
+    def toggle_cores(self,enabled):
+        self.logical = enabled
+        self.rebuild_graphs()
+        if self.snapshot:
+            self.render()
+
+    def rebuild_graphs(self):
+        for graph in self.graphs:
+            self.charts.removeWidget(graph)
+            graph.hide()
+            graph.deleteLater()
+        for row in range(self.charts.rowCount()):
+            self.charts.setRowStretch(row,0)
+        kind,_ = self.selection
+        count = (len(self.snapshot['cpu']['cores']) if self.snapshot else self.monitor.cpu_details[3][1]) if kind == 'cpu' and self.logical else 1
+        count = int(count) if str(count).isdigit() else 1
+        if kind == 'gpus':
+            count = 4
+        elif kind == 'disks':
+            count = 2
+        cols = 1 if kind == 'disks' else (4 if count > 8 else (2 if count > 1 else 1))
+        self.graphs = []
+        for i in range(count):
+            graph = Graph(COLORS[kind])
+            graph.setMinimumSize(50,45)
+            graph.setToolTip(f'Processore logico {i}' if count > 1 else 'Ultimi 60 secondi')
+            self.charts.addWidget(graph,i//cols,i%cols)
+            self.graphs.append(graph)
+            if kind == 'disks':
+                self.charts.setRowStretch(i,3 if i == 0 else 1)
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        self.pause.setText('Riprendi' if self.paused else 'Sospendi')
+        self.pause.setIcon(icon('play' if self.paused else 'pause'))
+        if not self.paused and self.snapshot:
+            self.render()
+
+    def render(self):
+        data = self.snapshot
+        for (kind,key),button in self.resources.items():
+            d = data[kind] if kind in ('cpu','memory') else data[kind].get(key)
+            if d is None:
+                button.subtitle.setText('Dispositivo non disponibile')
+                continue
+            if kind == 'cpu':
+                sub = f"{percent(d['value'])}  {d['freq']:.2f} GHz" if d['freq'] is not None else percent(d['value'])
+            elif kind == 'memory':
+                sub = f"{d['used']/1024**3:.1f}/{d['total']/1024**3:.1f} GB ({d['value']:.0f}%)"
+            elif kind == 'disks':
+                sub = f"{d['type']}\n{percent(d['value'])}"
+            elif kind == 'nets':
+                sub = f"{key}\n{network_summary(d['sent'],d['received'])}" if d['connected'] else f'{key}\nDisconnesso'
+            else:
+                sub = f"{d['name']}\n{percent(d['value'])}"
+            button.subtitle.setText(sub)
+            button.setToolTip(f'{button.title.text()}\n{sub}')
+            history = list(self.histories[(kind,key)])
+            button.graph.samples = [(history[-1][0]-60,d['value']), history[-1]] if kind == 'memory' and history else history
+            button.graph.maximum = max(1000,max((v for _,v in history if v is not None),default=0)*1.1) if kind == 'nets' else 100
+            button.graph.update()
+        kind,key = self.selection
+        d = data[kind] if kind in ('cpu','memory') else data[kind].get(key)
+        if d is None:
+            self.notice.setText('Dispositivo non disponibile. Ricollegalo e riavvia l’app.')
+            return
+        self.notice.setText('')
+        self.composition.setVisible(kind == 'memory')
+        self.composition_label.setVisible(kind == 'memory')
+        values, details = [], []
+        self.scale.setText('100%')
+        if kind == 'cpu':
+            self.heading.setText('CPU')
+            self.device.setText(self.monitor.cpu_name)
+            self.chart_label.setText('% di utilizzo')
+            values = [('Utilizzo',percent(d['value'])),('Velocità',f"{d['freq']:.2f} GHz" if d['freq'] is not None else 'N/D'),('Processi',str(d['processes'])),('Thread',str(d['threads'])),('File allocati',str(d['files'])),('Tempo di attività',uptime(d['uptime']))]
+            details = self.monitor.cpu_details
+        elif kind == 'memory':
+            self.heading.setText('Memoria')
+            self.device.setText(size(d['total']))
+            self.chart_label.setText('Utilizzo memoria')
+            self.scale.setText(size(d['total']))
+            self.composition.setValue(round(d['value']*10))
+            self.composition.setToolTip(f"In uso: {size(d['used'])} · disponibile: {size(d['available'])}")
+            values = [('In uso',size(d['used'])),('Disponibile',size(d['available'])),('Cache',size(d['cached'])),('Swap in uso',size(d['swap']))]
+            details = [('Totale:',size(d['total'])),('Buffer:',size(d['buffers'])),('Memoria condivisa:',size(d['shared'])),('Swap totale:',size(d['swap_total']))]
+        elif kind == 'disks':
+            self.heading.setText(self.resources[(kind,key)].full_title.split(' (')[0])
+            self.device.setText(d['model'])
+            self.chart_label.setText('Tempo di attività')
+            values = [('Tempo di attività',percent(d['value'])),('Risposta media',f"{d['latency']:.1f} ms"),('Velocità lettura',size(d['read'])+'/s'),('Velocità scrittura',size(d['write'])+'/s')]
+            details = [('Capacità:',size(d['capacity'])),('Tipo:',d['type']),('Dispositivo:',f'/dev/{key}')]
+        elif kind == 'nets':
+            self.heading.setText('Wi-Fi' if d['wifi'] else 'Ethernet')
+            self.device.setText(key)
+            self.chart_label.setText('Velocità effettiva')
+            values = [('Invio',bitrate(d['sent'])),('Ricezione',bitrate(d['received']))]
+            details = [('Nome scheda:',key),('Tipo di connessione:','Wi-Fi' if d['wifi'] else 'Ethernet / virtuale'),('Indirizzo IPv4:',d['ipv4']),('Indirizzo IPv6:',d['ipv6'])]
+            self.notice.setText('Linea continua: ricezione · linea tratteggiata: invio' if d['connected'] else 'Disconnesso')
+        else:
+            self.heading.setText(f'GPU {key}')
+            self.device.setText(d['name'])
+            self.chart_label.setText('Utilizzo GPU')
+            values = [('Utilizzo',percent(d['value'])),('Memoria dedicata',size(d['vram'])),('Frequenza',f"{d['freq']} MHz" if d['freq'] is not None else 'N/D')]
+            details = [('Driver:',d['driver']),('Bus PCI:',d['pci']),('Memoria dedicata totale:',size(d['vram_total']))]
+            if d['partial']:
+                self.notice.setText('Utilizzo calcolato dai client GPU accessibili al tuo utente (fdinfo). I contatori non esposti dal driver sono indicati come non disponibili.')
+            if d['value'] is None:
+                self.notice.setText('Il driver non espone un contatore di utilizzo accessibile. Nessun valore simulato.')
+        history = list(self.histories[(kind,key)])
+        maximum = max(1000,max((v for _,v in history if v is not None),default=0)*1.1) if kind == 'nets' else 100
+        if kind == 'nets':
+            self.scale.setText(bitrate(maximum))
+        for i,graph in enumerate(self.graphs):
+            graph.samples = list(self.histories[('core',str(i))]) if kind == 'cpu' and self.logical else history
+            graph.maximum = maximum
+            if kind == 'nets':
+                graph.samples = list(self.histories[('received',key)])
+                graph.secondary = list(self.histories[('sent',key)])
+            else:
+                graph.secondary = []
+            if kind == 'disks' and i == 1:
+                graph.samples = list(self.histories[('disk-read',key)])
+                graph.secondary = list(self.histories[('disk-write',key)])
+                graph.maximum = max(1024, max((v for _,v in graph.samples+graph.secondary),default=0)*1.1)
+                graph.caption = 'Lettura / scrittura · '+size(graph.maximum)+'/s'
+            elif kind == 'gpus':
+                engines = list(d['engines'])
+                names = engines + [n for n in ('render','copy','video','compute') if n not in engines]
+                name = names[i]
+                graph.samples = list(self.histories[(f'gpu-{key}',name)])
+                graph.caption = name+' · '+percent(d['engines'].get(name))
+            graph.update()
+        self.set_stats(values,details)
+        self.info_text = self.heading.text()+' — '+self.device.text()+'\n'+'\n'.join(f'{k}: {v}' for k,v in values)+'\n'+'\n'.join(f'{k} {v}' for k,v in details)
+
+    def set_stats(self,values,details):
+        signature = tuple(k for k,_ in values), tuple(k for k,_ in details)
+        if getattr(self,'stats_signature',None) == signature:
+            for widget,(_,value) in zip(self.value_labels,values):
+                widget.setText(value)
+            for widget,(_,value) in zip(self.detail_labels,details):
+                widget.setText(value)
+            return
+        self.stats_signature = signature
+        self.value_labels, self.detail_labels = [], []
+        while self.stats_layout.count():
+            item = self.stats_layout.takeAt(0)
+            if item.widget():
+                item.widget().hide()
+                item.widget().deleteLater()
+        left = QWidget()
+        grid = QGridLayout(left)
+        grid.setContentsMargins(0,0,0,0)
+        grid.setSpacing(12)
+        for i,(name,value) in enumerate(values):
+            cell = QWidget()
+            column = QVBoxLayout(cell)
+            column.setContentsMargins(0,0,0,0)
+            column.setSpacing(3)
+            column.addWidget(label(name,11,'#cccccc'))
+            value_label = label(value,20 if len(value)<17 else 14)
+            self.value_labels.append(value_label)
+            column.addWidget(value_label)
+            if self.selection[0] == 'cpu':
+                row, col, span = (0,i*3,3) if i < 2 else ((1,(i-2)*2,2) if i < 5 else (2,0,6))
+                grid.addWidget(cell,row,col,1,span)
+            else:
+                grid.addWidget(cell,i//2,i%2)
+        grid.setRowStretch((len(values)+1)//2,1)
+        self.stats_layout.addWidget(left)
+        right = QWidget()
+        rows = QGridLayout(right)
+        rows.setContentsMargins(0,0,0,0)
+        rows.setHorizontalSpacing(16)
+        rows.setVerticalSpacing(3)
+        for i,(name,value) in enumerate(details):
+            rows.addWidget(label(name,11,'#cccccc'),i,0)
+            val = label(value,11)
+            val.setWordWrap(True)
+            self.detail_labels.append(val)
+            rows.addWidget(val,i,1)
+        rows.setRowStretch(len(details),1)
+        self.stats_layout.addWidget(right,1)
+
+    def copy_info(self):
+        QApplication.clipboard().setText(getattr(self,'info_text','In attesa dei contatori'))
+
+    def about(self):
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.information(self,'Gestione attività per Linux','Prestazioni Linux\nPython + Qt · dati reali da psutil, /proc e /sys.\n\nProcessi e Prestazioni nello stile di Windows 11.\nTerminazione dei processi del proprio utente con conferma.\n\nCampionamento: 1 secondo · cronologia: 60 secondi.\nNon richiede privilegi amministrativi.')
+
+    def resizeEvent(self,event):
+        super().resizeEvent(event)
+        if hasattr(self,'navigation') and self.width() < 1000 and self.navigation.width() > 100:
+            self.toggle_navigation()
+
+    def closeEvent(self,event):
+        self.timer.stop()
+        self.sampler.wait()
+        event.accept()
+
+
+def network_summary(sent,received):
+    divisor,unit = (1e6,'Mbps') if max(sent,received) >= 1e6 else (1e3,'Kbps')
+    return f'I:{sent/divisor:.1f} R:{received/divisor:.1f} {unit}'
+
+
+def bitrate(value):
+    for unit in ('bps','Kbps','Mbps','Gbps'):
+        if value < 1000 or unit == 'Gbps':
+            return f'{value:.1f} {unit}'
+        value /= 1000
+
+
+STYLE = '''
+QWidget { color:#eeeeee; background:transparent; font-family:"Segoe UI","Noto Sans"; font-size:12px; }
+#window, #navigation, #titlebar { background:#202020; }
+#window { border:1px solid #3d3d3d; border-radius:8px; }
+#surface, #resources, QScrollArea, QScrollArea > QWidget > QWidget { background:#191919; }
+#toolbar { background:#272727; border-top-left-radius:8px; border-bottom:1px solid #303030; }
+QScrollArea { border:none; }
+QPushButton, QToolButton { border:none; border-radius:4px; padding:7px; background:transparent; }
+QPushButton:hover, QToolButton:hover { background:#333333; }
+QPushButton:focus-visible, QToolButton:focus-visible { border:1px solid #eeeeee; }
+QPushButton:disabled { color:#858585; }
+#close:hover { background:#c42b1c; }
+#nav { text-align:left; padding-left:12px; }
+#nav:checked { background:#303030; border-left:3px solid #d48bbb; }
+#resource { background:#191919; border-radius:0; text-align:left; padding:0; }
+#resource:hover { background:#252525; }
+#resource:checked { background:#2c2c2c; }
+QScrollBar:vertical { background:#202020; width:8px; }
+QScrollBar::handle:vertical { background:#555555; border-radius:3px; min-height:24px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
+#process-page { background:#191919; }
+QLineEdit { background:#292929; border:1px solid #444444; border-bottom:1px solid #aaaaaa; border-radius:4px; padding:8px; }
+QLineEdit:focus { border-bottom:2px solid #d48bbb; }
+QTableView { background:#191919; border:none; selection-background-color:#414141; selection-color:#ffffff; }
+QTableView::item { padding:0 8px; border:none; }
+QTableView::item:selected { background:#414141; color:white; }
+QHeaderView::section { background:#202020; color:#eeeeee; border:none; border-right:1px solid #353535; border-bottom:1px solid #353535; padding:6px 8px; }
+QMenu { background:#2b2b2b; border:1px solid #444444; padding:4px; }
+QMenu::item { padding:8px 24px; }
+QMenu::item:selected { background:#404040; }
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--screenshot',type=Path,help='Save an actual live render after 4 samples and exit')
+    args = parser.parse_args()
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName('linux-task-manager')
+    app.setApplicationDisplayName('Gestione attività Linux')
+    app.setDesktopFileName('linux-task-manager')
+    app.setStyle('Fusion')
+    app.setStyleSheet(STYLE)
+    window = Window()
+    window.show()
+    if args.screenshot:
+        def capture():
+            window.grab().save(str(args.screenshot))
+            window.close()
+        QTimer.singleShot(4200,capture)
+    return app.exec()
+
+
+if __name__ == '__main__':
+    sys.exit(main())
