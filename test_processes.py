@@ -56,6 +56,9 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(group['network'],300)
         self.assertEqual([row['pid'] for row in group['children']],[1,2,3])
         self.assertNotIn('_parent',rows[0])
+        remote_scripts = [dict(base,pid=i,name='python',exe='/usr/bin/python',cmdline=[],command_id=digest*64)
+            for i,digest in ((101,'a'),(102,'a'),(103,'b'))]
+        self.assertEqual(sorted(len(row.get('children',[row])) for row in process_groups(remote_scripts)),[1,2])
 
     def test_group_expansion_child_selection_and_pid_filter_survive_refresh(self):
         window = Window()

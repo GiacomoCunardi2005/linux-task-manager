@@ -30,7 +30,8 @@ def process_groups(rows):
             if program.startswith(parent_program+'-'):
                 program = parent_program
         args = row.get('cmdline',[])
-        script = tuple(args[1:]) if Path(program).name.startswith(('python','pypy')) or Path(program).name in ('node','nodejs','java','bash','sh') else ()
+        interpreter = program.startswith(('python','pypy')) or program in ('node','nodejs','java','bash','sh')
+        script = ((row['command_id'],) if row.get('command_id') else tuple(args[1:])) if interpreter else ()
         key = (row.get('uid',row['user']),program,script)
         groups.setdefault(key,[]).append(row)
     result = []
@@ -206,6 +207,7 @@ class ProcessPage(QWidget):
         super().__init__()
         self.setObjectName('process-page')
         self.paused = False
+        self.read_only = False
         self.latest = None
         root = QVBoxLayout(self)
         root.setContentsMargins(0,0,0,0)
@@ -270,6 +272,19 @@ class ProcessPage(QWidget):
         self.status.setStyleSheet('color:#bdbdbd; padding:8px 16px; font-size:11px;')
         root.addWidget(self.status)
 
+    def reset(self,read_only=False):
+        self.read_only = read_only
+        self.latest = None
+        self.paused = False
+        self.pause.setText('Sospendi')
+        self.search.clear()
+        self.model.beginResetModel()
+        self.model.rows, self.model.totals = [],{}
+        self.model.process_count = 0
+        self.model.endResetModel()
+        self.selection_changed()
+        self.status.setText('In attesa dei processi remoti…' if read_only else 'Lettura dei processi…')
+
     def selected(self):
         rows = self.table.selectionModel().selectedRows()
         if not rows:
@@ -278,8 +293,8 @@ class ProcessPage(QWidget):
 
     def selection_changed(self,*args):
         row = self.selected()
-        self.end_task.setToolTip('Espandi il gruppo e seleziona il singolo PID da terminare' if row and 'children' in row else 'Termina il processo selezionato')
-        self.end_task.setEnabled(bool(row and row['uid'] == os.getuid() and row['created'] is not None and row['pid'] is not None and row['pid'] not in (0,1,os.getpid())))
+        self.end_task.setToolTip('Monitoraggio remoto in sola lettura' if self.read_only else 'Espandi il gruppo e seleziona il singolo PID da terminare' if row and 'children' in row else 'Termina il processo selezionato')
+        self.end_task.setEnabled(bool(not self.read_only and row and row['uid'] == os.getuid() and row['created'] is not None and row['pid'] is not None and row['pid'] not in (0,1,os.getpid())))
 
     def filter_changed(self,text):
         self.proxy.query = text.casefold()
@@ -326,7 +341,7 @@ class ProcessPage(QWidget):
 
     def end_selected(self):
         row = self.selected()
-        if not row or not self.end_task.isEnabled():
+        if self.read_only or not row or not self.end_task.isEnabled():
             return
         answer = QMessageBox.question(self,'Termina attività',
             f"Terminare {row['name']} (PID {row['pid']})?\nI dati non salvati potrebbero andare persi.",

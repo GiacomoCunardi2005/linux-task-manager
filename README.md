@@ -10,13 +10,67 @@ cd linux-task-manager
 ./start.sh
 ```
 
-Il primo avvio crea un ambiente Python locale e installa Qt Essentials e psutil, se mancanti. Non richiede root. Su altre distribuzioni servono Python 3 con venv/pip e le librerie di sistema per Qt/Wayland o X11. Su Arch/CachyOS i prerequisiti sono `python`, `python-pip` e le normali librerie del desktop. Nessun servizio, porta di rete o modifica alla configurazione del sistema.
+Il primo avvio crea un ambiente Python locale e installa Qt Essentials e psutil, se mancanti. Non richiede root. Su altre distribuzioni servono Python 3 con venv/pip e le librerie di sistema per Qt/Wayland o X11. Su Arch/CachyOS i prerequisiti sono `python`, `python-pip` e le normali librerie del desktop. L’avvio desktop locale non crea servizi né apre porte di rete. La modalità server è separata e opzionale.
 
 Per aggiungerla al menu applicazioni dell'utente:
 
 ```bash
 ./install-desktop.sh
 ```
+
+## Server senza schermo e monitoraggio da un altro PC
+
+Sul computer da monitorare servono **Python 3, venv/pip, OpenSSL e Git**. Non occorrono desktop, Qt, X11 o Wayland. L’installatore usa soltanto psutil come dipendenza Python. Su Debian/Ubuntu i pacchetti sono `python3-venv python3-pip openssl git`; su Arch/CachyOS `python python-pip openssl git`.
+
+Da terminale o SSH, come utente normale:
+
+```bash
+git clone https://github.com/GiacomoCunardi2005/linux-task-manager.git
+cd linux-task-manager
+./install-server.sh
+```
+
+L’installatore copia il server in `~/.local/share/linux-task-manager-server`, crea un ambiente `.venv-server` separato e un servizio systemd dell’utente. Stampa una **chiave di accesso**: copiala e conservala privata. Chiave e certificato restano in `~/.config/linux-task-manager-server` con token e chiave privata leggibili solo dall’utente. Reinstallare aggiorna il codice mantenendo la stessa chiave.
+
+Per tenerlo attivo anche dopo logout e avviarlo al riavvio senza login, esegui una volta sul server:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+Sul PC con l’interfaccia grafica, avvia/aggiorna l’app e premi **Connetti a un server** nella barra superiore. Inserisci **IP o nome host**, porta **8765** e chiave completa. Processi e Prestazioni mostreranno i dati remoti, compresi dispositivi e cronologie. La barra indica sempre il PC remoto; dallo stesso pulsante scegli **Torna al PC locale**. La chiave non viene salvata dal client: si reinserisce a ogni connessione/avvio.
+
+Il servizio ascolta su tutte le IPv4, TCP 8765. Se il server ha un firewall, consenti questa porta soltanto al PC di monitoraggio o alla rete privata/VPN. Usa questa versione su LAN o VPN; non è progettata come servizio pubblico Internet. HTTPS è obbligatorio: la chiave contiene l’impronta SHA-256 del certificato e il token, e il client verifica l’impronta **prima** di inviare il token. Non accetta un certificato diverso, neppure se firmato da un’autorità pubblica. Il certificato generato dura dieci anni; per rinnovarlo fermare il servizio, eliminare solo `certificate.pem` e `private-key.pem`, rieseguire `--init` e usare la nuova chiave completa nei client.
+
+Il monitoraggio remoto è **in sola lettura**: non esistono comandi di terminazione remoti e il client non può applicare i PID remoti al PC locale. I dati includono nomi dei processi, utenti, eseguibili, montaggi e indirizzi di rete; gli argomenti completi dei comandi non vengono trasmessi. Un identificatore HMAC per sessione distingue gli script senza esporne gli argomenti. Sono visibili solo i contatori accessibili all’utente che esegue il server; NetHogs e `iw` restano opzionali e richiedono i rispettivi permessi. Alla perdita della connessione compare un errore e l’app ritenta automaticamente; gli ultimi valori visualizzati non sono dati live finché il collegamento non riprende. La cronologia desktop comincia al collegamento, non viene archiviata sul server.
+
+Comandi utili sul server:
+
+```bash
+systemctl --user status linux-task-manager-server
+journalctl --user -u linux-task-manager-server -n 30
+~/.local/share/linux-task-manager-server/start-server.sh --show-key
+systemctl --user stop linux-task-manager-server
+```
+
+Su distribuzioni senza systemd, oppure per l’avvio manuale dalla cartella del progetto:
+
+```bash
+./start-server.sh --init
+./start-server.sh --host 0.0.0.0 --port 8765
+```
+
+`--host` limita l’ascolto a un IP; per IPv6 usa ad esempio `--host ::` nell’avvio manuale. `--config /percorso` cambia la directory delle credenziali. Per personalizzare l’indirizzo/porta del servizio usa `systemctl --user edit linux-task-manager-server`, sostituendo `ExecStart` con il percorso assoluto del launcher e i nuovi argomenti; poi riavvia il servizio. `Ctrl+C` o SIGTERM arrestano il campionatore e il relativo helper NetHogs.
+
+Per disinstallare il servizio:
+
+```bash
+systemctl --user disable --now linux-task-manager-server
+rm ~/.config/systemd/user/linux-task-manager-server.service
+systemctl --user daemon-reload
+```
+
+Poi puoi rimuovere `~/.local/share/linux-task-manager-server` e, se non servono più, le credenziali in `~/.config/linux-task-manager-server`. L’eventuale linger è una proprietà condivisa dagli altri servizi dell’utente: non viene disabilitato automaticamente.
 
 ## Cosa funziona
 
@@ -35,7 +89,7 @@ La cronologia si riempie dopo l'avvio: non contiene campioni simulati. La pausa 
 
 Il menu richiudibile contiene solo Processi e Prestazioni. La terminazione invia SIGTERM al singolo processo selezionato: non forza la chiusura né termina automaticamente i discendenti. Può causare la perdita dei dati non salvati. I processi altrui, PID 1 e l’app stessa sono protetti.
 
-Le voci raggruppano processi dello stesso utente con lo stesso nome di eseguibile; i helper con prefisso dell’app si uniscono soltanto quando il loro vero padre appartiene a quell’app. Gli interpreti con argomenti diversi rimangono separati. È un raggruppamento operativo Linux, non l’identità delle app Windows: programmi diversi con lo stesso nome di eseguibile possono condividere una voce, sempre espandibile. CPU, RSS, disco e rete vengono sommati sui dati disponibili; RSS può contare più volte pagine condivise. I gruppi non sono terminabili in blocco: espanderli e selezionare il PID desiderato.
+Le voci raggruppano processi dello stesso utente con lo stesso nome di eseguibile; gli helper con prefisso dell’app si uniscono soltanto quando il loro vero padre appartiene a quell’app. Gli interpreti con argomenti diversi rimangono separati. È un raggruppamento operativo Linux, non l’identità delle app Windows: programmi diversi con lo stesso nome di eseguibile possono condividere una voce, sempre espandibile. CPU, RSS, disco e rete vengono sommati sui dati disponibili; RSS può contare più volte pagine condivise. I gruppi non sono terminabili in blocco: espanderli e selezionare il PID desiderato.
 
 La rete per processo usa il comando opzionale [NetHogs](https://github.com/raboof/nethogs), già funzionante con i permessi di cattura su questo computer. Un sottoprocesso legge contatori TCP e UDP; l’app grafica rimane senza privilegi e non configura capabilities né esegue sudo. Il collector si arresta alla chiusura e si riavvia se cambiano le interfacce. Mancanza del programma, permessi insufficienti, contatori iniziali o scaduti producono N/D. I contatori sono associati a PID + data di creazione: PID riutilizzati non ereditano il traffico. Connessioni/pacchetti non attribuiti da NetHogs possono mancare; il totale delle interfacce in testata non deve coincidere con la somma delle righe. I nuovi processi hanno CPU e I/O N/D fino al secondo campione.
 
@@ -46,7 +100,7 @@ La somiglianza visiva è una ricostruzione, non una corrispondenza pixel per pix
 ## Verifica
 
 ```bash
-.venv/bin/python -m unittest -v test_metrics test_ui test_processes test_hardware test_process_network
+.venv/bin/python -m unittest -v test_metrics test_ui test_processes test_hardware test_process_network test_server
 ```
 
 Test della contabilizzazione CPU, reset dei contatori, coerenza dei dati Linux e interazione delle viste Qt (risorse, pausa, processori logici, copia, finestra compatta). La cartella locale `reference/` non viene pubblicata: può contenere schermate con dati del computer e riferimenti esterni. I test UI producono schermate reali in `reference/linux-*.png` usando Qt offscreen.

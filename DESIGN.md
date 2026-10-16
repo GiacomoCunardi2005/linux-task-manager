@@ -17,3 +17,7 @@ Memory statistics include configured RAM speed, used slots, form factor, type an
 Device resources synchronize from each completed sample. Removed/replaced devices discard their own histories and selection safely returns to CPU. NPU uses the same 60-second percentage graph with a warm accent. Network and disk details distinguish observed traffic from negotiated bus/radio rates; additional metadata stays under the graph and the detail pane scrolls vertically at compact heights.
 
 Process network cells show Mbps from NetHogs cumulative TCP/UDP byte deltas. No privileged GUI, automatic privilege changes, or zero values substituted for a failed capture backend. Expanded groups and the selected process identity survive refresh.
+
+## Remote source
+
+A title-bar connection button opens a compact IP/host, port and access-key form. The source label remains visible on both pages, names the remote host and marks read-only mode or connection failure. The connection form offers a return to the local PC. Source changes clear selected PID, all charts and old resource labels; late signals from an earlier sampler are ignored. Existing graph/page layouts remain shared by local and remote monitoring.
