@@ -638,7 +638,11 @@ class Window(QWidget):
             else:
                 sub = f"{d['name']}\n{percent(d['value'])}"
             button.subtitle.setText(sub)
-            button.setToolTip(f'{button.title.text()}\n{sub}')
+            tooltip = f'{button.title.text()}\n{sub}'
+            if kind == 'nets':
+                hardware = d.get('hardware',{})
+                tooltip += '\n'+' · '.join(v for v in (hardware.get('manufacturer'),hardware.get('model')) if v)
+            button.setToolTip(tooltip)
             history = list(self.histories[(kind,key)])
             button.graph.samples = [(history[-1][0]-60,d['value']), history[-1]] if kind == 'memory' and history else history
             button.graph.maximum = max(1_000_000,max((v for _,v in history if v is not None),default=0)*1.1) if kind == 'nets' else 100
@@ -653,6 +657,7 @@ class Window(QWidget):
             self.notice.setText('Dispositivo non disponibile. In attesa del rilevamento automatico.')
             return
         self.notice.setText('')
+        self.device.setToolTip('')
         self.composition.setVisible(kind == 'memory')
         self.composition_label.setVisible(kind == 'memory')
         values, details = [], []
@@ -700,11 +705,20 @@ class Window(QWidget):
             self.notice.setText('La velocità negoziata è quella del collegamento, distinta dal trasferimento effettivo. Primo campione: in attesa dei contatori.' if d['value'] is None else 'La velocità negoziata del collegamento è distinta dalla velocità effettiva di lettura e scrittura.')
         elif kind == 'nets':
             self.heading.setText('Wi-Fi' if d['wifi'] else 'Ethernet')
-            self.device.setText(key)
+            hardware = d.get('hardware',{})
+            self.device.setText(hardware.get('model') or key)
+            self.device.setToolTip(self.device.text())
             self.chart_label.setText('Velocità effettiva')
             values = [('Invio',bitrate(d['sent'])),('Ricezione',bitrate(d['received']))]
-            adapter = [('Nome scheda:',key),('Tipo di connessione:','Wi-Fi' if d['wifi'] else 'Ethernet / virtuale'),
-                ('Driver:',d['driver'] or 'Non disponibile'),('MTU:',str(d['mtu']) if d['mtu'] else 'Non disponibile')]
+            hardware_id = ':'.join([hardware['vendor_id'],hardware['device_id']]) if hardware.get('vendor_id') and hardware.get('device_id') else 'Non disponibile'
+            identity = [('Produttore:',hardware.get('manufacturer') or 'Non disponibile'),
+                ('Modello:',hardware.get('model') or 'Non disponibile'),('ID hardware:',hardware_id)]
+            if hardware.get('registered_vendor') and hardware['registered_vendor'] != hardware.get('manufacturer'):
+                identity += [('Fornitore ID:',hardware['registered_vendor'])]
+            adapter = [('Interfaccia:',key),('Tipo di connessione:','Wi-Fi' if d['wifi'] else 'Ethernet / virtuale'),
+                ('Driver:',d['driver'] or 'Non disponibile'),('MTU:',str(d['mtu']) if d['mtu'] else 'Non disponibile'),
+                ('Bus hardware:',hardware.get('bus') or d['link']['bus'] or 'Non disponibile'),
+                ('Posizione:',hardware.get('location') or 'Non disponibile')]
             addresses = [('Indirizzo IPv4:',d['ipv4']),('Indirizzo IPv6:',d['ipv6']),
                 ('Indirizzo MAC:',d['mac'] or 'Non disponibile')]
             if d['wifi']:
@@ -718,7 +732,9 @@ class Window(QWidget):
                     ('Duplex:',d['duplex'] or 'Non disponibile')]
             if d['link']['bus'] == 'USB':
                 adapter += [('Collegamento USB:',d['link']['link_speed'] or 'Non disponibile')]
-            detail_columns = [[('Collegamento Wi-Fi' if d['wifi'] else 'Collegamento Ethernet',connection)],
+            elif d['link']['link_speed']:
+                adapter += [('Velocità bus:',d['link']['link_speed'])]
+            detail_columns = [[('Identità hardware',identity),('Collegamento Wi-Fi' if d['wifi'] else 'Collegamento Ethernet',connection)],
                 [('Scheda di rete',adapter),('Indirizzi',addresses)]]
             if d['link'].get('usb_route'):
                 detail_columns[0].append(('Percorso USB',[('Collegamento:',d['link']['usb_route']),('Controller:',d['link']['usb_controller'])]))
@@ -857,7 +873,7 @@ class Window(QWidget):
                 rows.setColumnStretch(1,1)
                 row = 0
                 for name,value in items:
-                    full_width = title == 'Indirizzi' and name == 'Indirizzo IPv6:'
+                    full_width = (title == 'Indirizzi' and name == 'Indirizzo IPv6:') or (title == 'Identità hardware' and name == 'Modello:')
                     name_label = label(name,11,'#cccccc')
                     name_label.setWordWrap(True)
                     rows.addWidget(name_label,row,0,1,2 if full_width else 1,Qt.AlignTop)

@@ -113,6 +113,8 @@ class ServerTests(unittest.TestCase):
                 validate_packet(invalid)
         legacy = copy.deepcopy(packet)
         legacy['data'].pop('connections',None)
+        for device in legacy['data']['nets'].values():
+            device.pop('hardware',None)
         validate_packet(legacy)
         self.assertLess(self.snapshots.updated,time.monotonic()+1)
         with patch('server.time.monotonic',return_value=self.snapshots.updated+11):

@@ -87,6 +87,8 @@ def validate_packet(packet):
                 fields(device, 'ipv4 ipv6', lambda v:isinstance(v,str))
                 fields(device, 'duplex mac driver ssid standard band frequency channel width signal rx_rate tx_rate bssid', text)
                 fields(device, 'connected wifi', lambda v:type(v) is bool)
+                if 'hardware' in device:
+                    fields(device['hardware'],'manufacturer model registered_vendor vendor_id device_id bus location',text)
                 fields(device.get('link'), 'bus link_speed', text)
                 if 'usb_route' in device['link']:
                     fields(device['link'],'usb_route usb_controller',lambda v:isinstance(v,str))

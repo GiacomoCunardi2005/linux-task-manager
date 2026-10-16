@@ -8,7 +8,7 @@ from collections import Counter
 import time
 import psutil
 from process_network import ProcessNetwork
-from hardware import read, number, disk_devices, gpu_devices, npu_devices, wifi_link, link_details, network_identity, connection_devices
+from hardware import read, number, disk_devices, gpu_devices, npu_devices, wifi_link, link_details, network_identity, connection_devices, network_hardware
 
 
 def rate(current, previous, elapsed):
@@ -108,6 +108,7 @@ class Monitor:
         self.last_disks = psutil.disk_io_counters(perdisk=True,nowrap=False)
         self.last_net = psutil.net_io_counters(pernic=True,nowrap=False)
         self.last_net_ids = {name:network_identity(name) for name in self.last_net}
+        self.net_hardware = {}
         self.last_gpu = {}
         self.last_disk_ids = {}
         self.last_npu = {}
@@ -234,6 +235,8 @@ class Monitor:
             if not cur:
                 continue
             identity = network_identity(name)
+            if name not in self.net_hardware or self.last_net_ids.get(name) != identity:
+                self.net_hardware[name] = network_hardware(Path('/sys/class/net')/name)
             if self.last_net_ids.get(name) != identity or (prev and (cur.bytes_sent < prev.bytes_sent or cur.bytes_recv < prev.bytes_recv)):
                 prev = None
             prev = prev or cur
@@ -244,7 +247,7 @@ class Monitor:
                 'ipv6': next((a.address.split('%')[0] for a in addresses.get(name, []) if a.family == socket.AF_INET6), 'Non disponibile'),
                 'connected': bool(states.get(name) and states[name].isup and read(f'/sys/class/net/{name}/carrier') != '0'),
                 'wifi': Path(f'/sys/class/net/{name}/wireless').exists(),
-                'identity':identity,
+                'identity':identity, 'hardware':self.net_hardware[name],
                 'speed':states[name].speed if name in states and states[name].speed > 0 else None,
                 'duplex':{psutil.NIC_DUPLEX_FULL:'Full duplex',psutil.NIC_DUPLEX_HALF:'Half duplex'}.get(states[name].duplex) if name in states else None,
                 'mtu':states[name].mtu if name in states else None,
@@ -255,6 +258,7 @@ class Monitor:
                 result['nets'][name].update(wifi_link(name))
         result['process_network_status'] = self.process_network.sample(rows,[(name,d['identity']) for name,d in result['nets'].items() if d['connected']])
         self.last_net_ids = {name:d['identity'] for name,d in result['nets'].items()}
+        self.net_hardware = {name:self.net_hardware[name] for name in result['nets']}
         gpus = gpu_devices()
         clients = self._gpu_clients() if gpus else {}
         for gpu in gpus:

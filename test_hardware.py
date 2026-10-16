@@ -1,11 +1,12 @@
 import copy
 from pathlib import Path
 import tempfile
+import subprocess
 import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-from hardware import disk_devices, npu_devices, parse_wifi_link, wifi_link, connection_devices, link_details
+from hardware import disk_devices, npu_devices, parse_wifi_link, wifi_link, connection_devices, link_details, network_hardware
 from metrics import Monitor
 from app import Window
 import test_ui
@@ -94,12 +95,63 @@ class HardwareTests(unittest.TestCase):
         with patch('metrics.disk_devices',return_value={}):
             self.assertEqual(monitor.sample()['disks'],{})
 
+    def test_network_manufacturer_model_and_usb_brand_are_real_not_guessed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            pci = root/'0000:00:14.3'
+            pci.mkdir()
+            (pci/'vendor').write_text('0x8086')
+            (pci/'device').write_text('0x7e40')
+            (pci/'current_link_speed').write_text('Unknown')
+            (pci/'current_link_width').write_text('0')
+            self.assertIsNone(link_details(pci)['link_speed'])
+            (pci/'current_link_speed').write_text('8.0 GT/s PCIe')
+            (pci/'current_link_width').write_text('1')
+            self.assertEqual(link_details(pci)['link_speed'],'8.0 GT/s PCIe ×1')
+            net = root/'wlan-test'
+            net.mkdir()
+            (net/'device').symlink_to(pci,target_is_directory=True)
+            reply = SimpleNamespace(returncode=0,stdout='ID_VENDOR_FROM_DATABASE=Intel Corporation\nID_MODEL_FROM_DATABASE=Test Wi-Fi chipset\n')
+            with patch('hardware.subprocess.run',return_value=reply):
+                info = network_hardware(net)
+            self.assertEqual(info['manufacturer'],'Intel Corporation')
+            self.assertEqual(info['model'],'Test Wi-Fi chipset')
+            self.assertEqual((info['vendor_id'],info['device_id']),('8086','7e40'))
+            self.assertEqual((info['bus'],info['location']),('PCI','0000:00:14.3'))
+            with patch('hardware.subprocess.run',side_effect=FileNotFoundError()):
+                info = network_hardware(net)
+            self.assertIsNone(info['manufacturer'])
+            self.assertIsNone(info['model'])
+            self.assertEqual(info['vendor_id'],'8086')
+            usb = root/'usb2'/'2-1'
+            interface = usb/'2-1:1.0'
+            interface.mkdir(parents=True)
+            for key,value in dict(idVendor='17ef',idProduct='a387',manufacturer='Realtek',product='Dock Ethernet').items():
+                (usb/key).write_text(value)
+            (net/'device').unlink()
+            (net/'device').symlink_to(interface,target_is_directory=True)
+            reply.stdout = 'ID_VENDOR_FROM_DATABASE=Lenovo\nID_MODEL=Sanitized_model\n'
+            with patch('hardware.subprocess.run',return_value=reply):
+                info = network_hardware(net)
+            self.assertEqual(info['manufacturer'],'Realtek')
+            self.assertEqual(info['registered_vendor'],'Lenovo')
+            self.assertEqual(info['model'],'Dock Ethernet')
+            self.assertEqual((info['bus'],info['location']),('USB','2-1'))
+            with patch('hardware.subprocess.run',side_effect=subprocess.TimeoutExpired('udevadm',2)):
+                self.assertEqual(network_hardware(net)['model'],'Dock Ethernet')
+            (net/'device').unlink()
+            with patch('hardware.subprocess.run') as command:
+                info = network_hardware(net)
+            command.assert_not_called()
+            self.assertEqual(info['bus'],'Virtuale')
+            self.assertIsNone(info['manufacturer'])
+
     def test_replaced_nic_with_same_name_starts_a_fresh_baseline(self):
         monitor = Monitor()
         self.addCleanup(monitor.close)
         identity = ['old-nic']
         counters = SimpleNamespace(bytes_sent=100,bytes_recv=200)
-        with patch('metrics.network_identity',side_effect=lambda name: identity[0]), patch('metrics.psutil.net_io_counters',return_value={'testnic':counters}) as mocked:
+        with patch('metrics.network_identity',side_effect=lambda name: identity[0]), patch('metrics.psutil.net_io_counters',return_value={'testnic':counters}) as mocked, patch('metrics.network_hardware',return_value={'model':'Test NIC'}) as lookup:
             self.assertEqual(monitor.sample()['nets']['testnic']['value'],0)
             counters = SimpleNamespace(bytes_sent=100,bytes_recv=300)
             mocked.return_value = {'testnic':counters}
@@ -107,6 +159,7 @@ class HardwareTests(unittest.TestCase):
             identity[0] = 'new-nic'
             mocked.return_value = {'testnic':SimpleNamespace(bytes_sent=100,bytes_recv=1000000000)}
             self.assertEqual(monitor.sample()['nets']['testnic']['value'],0)
+            self.assertEqual(lookup.call_count,2)
 
     def test_npu_sysfs_and_counter_units(self):
         with tempfile.TemporaryDirectory() as folder:

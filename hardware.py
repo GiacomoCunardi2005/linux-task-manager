@@ -48,8 +48,9 @@ def link_details(path):
             return {'bus':'SATA','link_speed':speed}
     for node in parents:
         if (node/'current_link_speed').exists():
-            width = read(node/'current_link_width')
-            return {'bus':'PCIe','link_speed':read(node/'current_link_speed')+(f' ×{width}' if width else '')}
+            speed, width = read(node/'current_link_speed'),number(node/'current_link_width')
+            speed = speed if re.match(r'[0-9]+(?:\.[0-9]+)? GT/s',speed) else None
+            return {'bus':'PCIe','link_speed':speed+(f' ×{width}' if width and width > 0 else '') if speed else None}
     return {'bus':None,'link_speed':None}
 
 
@@ -101,6 +102,33 @@ def npu_devices(root=Path('/sys/class/accel')):
 
 def network_identity(name):
     return str(Path(f'/sys/class/net/{name}').resolve())+'|'+read(f'/sys/class/net/{name}/address')
+
+
+def network_hardware(net):
+    net = Path(net)
+    device = (net/'device').resolve()
+    empty = dict(manufacturer=None,model=None,registered_vendor=None,vendor_id=None,device_id=None,bus='Virtuale',location=None)
+    if not (net/'device').exists():
+        return empty
+    try:
+        result = subprocess.run(['udevadm','info','--query=property','--path='+str(net)],
+            capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=2)
+        properties = dict(line.split('=',1) for line in result.stdout.splitlines() if '=' in line) if result.returncode == 0 else {}
+    except (OSError,subprocess.TimeoutExpired):
+        properties = {}
+    usb = next((p for p in (device,*device.parents) if (p/'idVendor').exists()),None)
+    pci = next((p for p in (device,*device.parents) if re.fullmatch(r'[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]',p.name)),None)
+    descriptor = usb if usb else pci if pci else device
+    def identity(value):
+        value = value.removeprefix('0x').lower()
+        return value if re.fullmatch(r'[0-9a-f]{4}',value) else None
+    return dict(manufacturer=read(descriptor/'manufacturer') or properties.get('ID_VENDOR_FROM_DATABASE') or properties.get('ID_VENDOR','').replace('_',' ') or None,
+        model=read(descriptor/'product') or properties.get('ID_MODEL_FROM_DATABASE') or properties.get('ID_MODEL','').replace('_',' ') or None,
+        registered_vendor=properties.get('ID_VENDOR_FROM_DATABASE') or None,
+        vendor_id=identity(read(descriptor/('idVendor' if usb else 'vendor')) or properties.get('ID_VENDOR_ID','')),
+        device_id=identity(read(descriptor/('idProduct' if usb else 'device')) or properties.get('ID_MODEL_ID','')),
+        bus='USB' if usb else 'PCI' if pci else properties.get('ID_BUS') or None,
+        location=usb.name if usb else pci.name if pci else device.name)
 
 
 def parse_wifi_link(output):

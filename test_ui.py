@@ -42,7 +42,8 @@ class UITests(unittest.TestCase):
                 link=dict(bus='USB',link_speed='5 Gbit/s'),ssid='Rete di laboratorio piano superiore',
                 standard='Wi-Fi 6 (802.11ax)',band='5 GHz',frequency='5320 MHz',channel='64',
                 width='80 MHz',signal='-48 dBm',rx_rate='1200.9 Mbit/s',tx_rate='1200.9 Mbit/s',
-                bssid='02:00:00:00:00:02')
+                bssid='02:00:00:00:00:02',hardware=dict(manufacturer='Produttore di prova',model='Scheda Wi-Fi AX di prova',
+                    registered_vendor='Fornitore di prova',vendor_id='1234',device_id='5678',bus='USB',location='2-1.2'))
             data['nets'] = {'wlan-test':device}
             window.receive(data)
             window.select('nets','wlan-test')
@@ -58,13 +59,17 @@ class UITests(unittest.TestCase):
             self.assertEqual(window.graphs[0].maximum,window.resources[('nets','wlan-test')].graph.maximum)
             names = ('Rete (SSID):','Standard Wi-Fi:','Banda:','Frequenza:','Canale:',
                 'Larghezza canale:','Segnale:','Bitrate RX (radio):','Bitrate TX (radio):',
-                'Nome scheda:','Tipo di connessione:','Driver:','MTU:','Collegamento USB:',
-                'Indirizzo IPv4:','Indirizzo IPv6:','Indirizzo MAC:','Punto di accesso:')
+                'Interfaccia:','Tipo di connessione:','Driver:','MTU:','Collegamento USB:',
+                'Indirizzo IPv4:','Indirizzo IPv6:','Indirizzo MAC:','Punto di accesso:',
+                'Produttore:','Modello:','ID hardware:','Fornitore ID:','Bus hardware:','Posizione:')
             self.assertEqual(len(window.detail_labels),len(names))
             for name in names:
                 self.assertIn(name,window.info_text)
             self.assertEqual({heading.text() for heading in window.stats.findChildren(QWidget,'detail-heading')},
-                {'Collegamento Wi-Fi','Scheda di rete','Indirizzi'})
+                {'Identità hardware','Collegamento Wi-Fi','Scheda di rete','Indirizzi'})
+            self.assertEqual(window.device.text(),device['hardware']['model'])
+            self.assertIn('1234:5678',window.info_text)
+            self.assertIn('Fornitore di prova',window.info_text)
             Path('reference').mkdir(exist_ok=True)
             window.toggle_pause()
             for width,height,expanded in ((1120,790,True),(900,660,False),(900,660,True)):
@@ -99,8 +104,8 @@ class UITests(unittest.TestCase):
             # Ethernet retains negotiated speed, duplex and every interface field.
             device['wifi'] = False
             window.receive(data)
-            self.assertEqual(len(window.detail_labels),10)
-            for name in ('Velocità collegamento:','Duplex:','Nome scheda:','Driver:','MTU:',
+            self.assertEqual(len(window.detail_labels),16)
+            for name in ('Velocità collegamento:','Duplex:','Interfaccia:','Driver:','MTU:',
                          'Tipo di connessione:','Indirizzo IPv4:','Indirizzo IPv6:',
                          'Indirizzo MAC:','Collegamento USB:'):
                 self.assertIn(name,window.info_text)
