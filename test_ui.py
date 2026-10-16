@@ -35,7 +35,8 @@ class UITests(unittest.TestCase):
             self.assertIsNotNone(window.snapshot)
             wait(1200)
             self.app.processEvents()
-            for pair,button in window.resources.items():
+            for pair,button in list(window.resources.items()):
+                window.findChild(QScrollArea,'resources').ensureWidgetVisible(button)
                 QTest.mouseClick(button,Qt.LeftButton)
                 self.app.processEvents()
                 self.assertEqual(window.selection,pair)
@@ -64,7 +65,7 @@ class UITests(unittest.TestCase):
             self.assertEqual(window.navigation.width(),52)
             window.toggle_navigation()
             Path('reference').mkdir(exist_ok=True)
-            for kind in ('cpu','memory','disks','nets','gpus'):
+            for kind in ('cpu','memory','disks','nets','gpus','npus'):
                 pair = next((p for p in window.resources if p[0]==kind),None)
                 if pair:
                     window.select(*pair)

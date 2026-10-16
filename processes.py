@@ -5,10 +5,10 @@ import math
 from pathlib import Path
 import shlex
 import psutil
-from PySide6.QtCore import Qt, QAbstractTableModel, QSortFilterProxyModel, QModelIndex, QStandardPaths
+from PySide6.QtCore import Qt, QAbstractItemModel, QSortFilterProxyModel, QModelIndex, QStandardPaths, QItemSelectionModel
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QTableView, QHeaderView, QAbstractItemView, QMessageBox, QStyledItemDelegate, QStyle)
+    QPushButton, QTreeView, QHeaderView, QAbstractItemView, QMessageBox, QStyledItemDelegate, QStyle)
 from metrics import size, terminate_process
 
 HEADERS = ['Nome','Stato','CPU','Memoria','Disco','Rete','PID']
@@ -17,7 +17,41 @@ STATES = {'running':'In esecuzione','sleeping':'In attesa','disk-sleep':'Attesa 
 SORT_ROLE = Qt.UserRole + 1
 
 
-class ProcessModel(QAbstractTableModel):
+def process_groups(rows):
+    groups = {}
+    by_pid = {row['pid']:row for row in rows}
+    for raw in rows:
+        row = dict(raw)
+        row['_identity'] = ('pid',row['pid'],row['created'])
+        program = Path(row.get('exe') or row['name']).name
+        parent = by_pid.get(row.get('ppid'))
+        if parent and parent.get('uid') == row.get('uid'):
+            parent_program = Path(parent.get('exe') or parent['name']).name
+            if program.startswith(parent_program+'-'):
+                program = parent_program
+        args = row.get('cmdline',[])
+        script = tuple(args[1:]) if Path(program).name.startswith(('python','pypy')) or Path(program).name in ('node','nodejs','java','bash','sh') else ()
+        key = (row.get('uid',row['user']),program,script)
+        groups.setdefault(key,[]).append(row)
+    result = []
+    for key,children in groups.items():
+        if len(children) == 1:
+            result.append(children[0])
+            continue
+        group = dict(children[0],name=key[1],pid=None,created=None,children=children,_identity=('app',key))
+        for metric in ('cpu','memory','disk','network'):
+            values = [row.get(metric) for row in children if row.get(metric) is not None]
+            group[metric] = sum(values) if values else None
+        group['status'] = f'{len(children)} processi'
+        for child in children:
+            child['_parent'] = group
+        result.append(group)
+    for index,row in enumerate(result):
+        row['_row'] = index
+    return result
+
+
+class ProcessModel(QAbstractItemModel):
     def __init__(self, fallback_icon):
         super().__init__()
         self.rows = []
@@ -50,7 +84,26 @@ class ProcessModel(QAbstractTableModel):
                     continue
 
     def rowCount(self,parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self.rows)
+        if not parent.isValid():
+            return len(self.rows)
+        return len(parent.internalPointer().get('children',[])) if parent.column() == 0 else 0
+
+    def index(self,row,column,parent=QModelIndex()):
+        if parent.isValid() and parent.column() != 0:
+            return QModelIndex()
+        nodes = parent.internalPointer().get('children',[]) if parent.isValid() else self.rows
+        if not 0 <= row < len(nodes) or not 0 <= column < len(HEADERS):
+            return QModelIndex()
+        return self.createIndex(row,column,nodes[row])
+
+    def parent(self,index):
+        if not index.isValid():
+            return QModelIndex()
+        parent = index.internalPointer().get('_parent')
+        return self.createIndex(parent['_row'],0,parent) if parent else QModelIndex()
+
+    def record(self,index):
+        return index.internalPointer() if index.isValid() else None
 
     def columnCount(self,parent=QModelIndex()):
         return len(HEADERS)
@@ -58,20 +111,23 @@ class ProcessModel(QAbstractTableModel):
     def data(self,index,role=Qt.DisplayRole):
         if not index.isValid():
             return None
-        row, column = self.rows[index.row()], index.column()
-        values = [row['name'],STATES.get(row['status'],row['status'] or 'N/D'),row['cpu'],row['memory'],row['disk'],None,row['pid']]
+        row, column = self.record(index), index.column()
+        name = row['name']+(f" ({len(row['children'])})" if 'children' in row else '')
+        values = [name,STATES.get(row['status'],row['status'] or 'N/D'),row['cpu'],row['memory'],row['disk'],row.get('network'),row['pid']]
         value = values[column]
         if role == SORT_ROLE:
             return (-1 if value is None else value) if column >= 2 else str(value).casefold()
         if role == Qt.DisplayRole:
             if value is None:
-                return 'N/D'
+                return '—' if column == 6 and 'children' in row else 'N/D'
             if column == 2:
                 return f'{value:.1f}%'
             if column == 3:
                 return f'{value/1024**2:,.1f} MB'
             if column == 4:
                 return f'{value/1024**2:.1f} MB/s'
+            if column == 5:
+                return f'{value/1e6:.2f} Mbps'
             return str(value)
         if role == Qt.TextAlignmentRole:
             return int(Qt.AlignVCenter | (Qt.AlignRight if column >= 2 else Qt.AlignLeft))
@@ -84,7 +140,9 @@ class ProcessModel(QAbstractTableModel):
             return self.icons[name]
         if role == Qt.ToolTipRole:
             if column == 5:
-                return 'Linux non espone la velocità di rete per processo tramite psutil.'
+                return 'Traffico TCP + UDP attribuito da NetHogs. Alcuni pacchetti o connessioni non attribuibili possono mancare. N/D: campione iniziale o cattura non disponibile.'
+            if 'children' in row:
+                return row['name']+' · PID: '+', '.join(str(child['pid']) for child in row['children'])+'\nConsumi aggregati disponibili; la somma RSS può contare pagine condivise. Espandi per selezionare un processo.'
             return f"{row['name']} · PID {row['pid']}\nUtente: {row['user']}\nMemoria: RSS residente; CPU: percentuale dell’intero sistema."
         if role == Qt.BackgroundRole and column in (2,3,4,5):
             strength = 0
@@ -94,6 +152,8 @@ class ProcessModel(QAbstractTableModel):
                 strength = (row['memory'] or 0)/max(1,self.totals.get('memory_total',1))
             elif column == 4:
                 strength = min(1,(row['disk'] or 0)/(20*1024**2))
+            elif column == 5:
+                strength = min(1,(row.get('network') or 0)/1e8)
             strength = math.sqrt(max(0,min(1,strength)))
             return QColor(51+int(strength*80),34+int(strength*32),39+int(strength*35))
         return None
@@ -111,9 +171,11 @@ class ProcessModel(QAbstractTableModel):
 
     def update(self,data):
         self.beginResetModel()
-        self.rows = data['process_rows']
+        self.process_count = len(data['process_rows'])
+        self.rows = process_groups(data['process_rows'])
+        disk_loads = [d['value'] for d in data['disks'].values() if d['value'] is not None]
         self.totals = {2:f"{data['cpu']['value']:.0f}%",3:f"{data['memory']['value']:.0f}%",
-            4:f"{max((d['value'] for d in data['disks'].values()),default=0):.0f}%",
+            4:f"{max(disk_loads):.0f}%" if disk_loads else 'N/D',
             5:f"{sum(d['sent']+d['received'] for d in data['nets'].values())/1e6:.1f} Mbps",
             'memory_total':data['memory']['total']}
         self.endResetModel()
@@ -123,7 +185,7 @@ class ProcessModel(QAbstractTableModel):
 class ProcessFilter(QSortFilterProxyModel):
     def filterAcceptsRow(self,row,parent):
         query = getattr(self,'query','')
-        item = self.sourceModel().rows[row]
+        item = self.sourceModel().record(self.sourceModel().index(row,0,parent))
         return query in f"{item['name']} {item['pid']} {item['user']}".casefold()
 
 
@@ -177,22 +239,24 @@ class ProcessPage(QWidget):
         self.model = ProcessModel(icon)
         self.proxy = ProcessFilter(self)
         self.proxy.setSourceModel(self.model)
+        self.proxy.setRecursiveFilteringEnabled(True)
+        self.proxy.setAutoAcceptChildRows(True)
         self.proxy.setSortRole(SORT_ROLE)
-        self.table = QTableView()
+        self.table = QTreeView()
+        self.table.setUniformRowHeights(True)
+        self.table.setIndentation(18)
+        self.table.setRootIsDecorated(True)
         self.table.setModel(self.proxy)
         self.table.setAccessibleName('Processi in esecuzione')
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setShowGrid(False)
         self.table.setWordWrap(False)
-        self.table.verticalHeader().hide()
-        self.table.verticalHeader().setDefaultSectionSize(30)
-        self.table.horizontalHeader().setFixedHeight(50)
-        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.header().setFixedHeight(50)
+        self.table.header().setStretchLastSection(False)
         for col,width in enumerate((240,112,78,100,96,88,66)):
             self.table.setColumnWidth(col,width)
-        self.table.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
+        self.table.header().setSectionResizeMode(0,QHeaderView.Stretch)
         self.heat_delegate = HeatDelegate(self.table)
         for col in (2,3,4,5):
             self.table.setItemDelegateForColumn(col,self.heat_delegate)
@@ -202,6 +266,7 @@ class ProcessPage(QWidget):
         self.search.textChanged.connect(self.filter_changed)
         root.addWidget(self.table,1)
         self.status = QLabel('Lettura dei processi…')
+        self.status.setWordWrap(True)
         self.status.setStyleSheet('color:#bdbdbd; padding:8px 16px; font-size:11px;')
         root.addWidget(self.status)
 
@@ -209,15 +274,18 @@ class ProcessPage(QWidget):
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             return None
-        return self.model.rows[self.proxy.mapToSource(rows[0]).row()]
+        return self.model.record(self.proxy.mapToSource(rows[0]))
 
     def selection_changed(self,*args):
         row = self.selected()
-        self.end_task.setEnabled(bool(row and row['uid'] == os.getuid() and row['created'] is not None and row['pid'] not in (0,1,os.getpid())))
+        self.end_task.setToolTip('Espandi il gruppo e seleziona il singolo PID da terminare' if row and 'children' in row else 'Termina il processo selezionato')
+        self.end_task.setEnabled(bool(row and row['uid'] == os.getuid() and row['created'] is not None and row['pid'] is not None and row['pid'] not in (0,1,os.getpid())))
 
     def filter_changed(self,text):
         self.proxy.query = text.casefold()
         self.proxy.invalidate()
+        if text:
+            self.table.expandAll()
         self.selection_changed()
         self.update_status()
 
@@ -226,22 +294,28 @@ class ProcessPage(QWidget):
         if self.paused:
             return
         old = self.selected()
-        identity = (old['pid'],old['created']) if old else None
+        identity = old['_identity'] if old else None
+        expanded = {self.model.record(self.proxy.mapToSource(self.proxy.index(i,0)))['_identity']
+            for i in range(self.proxy.rowCount()) if self.table.isExpanded(self.proxy.index(i,0))}
         position = self.table.verticalScrollBar().value()
         self.model.update(data)
-        if identity:
-            for i,row in enumerate(self.model.rows):
-                if (row['pid'],row['created']) == identity:
-                    index = self.proxy.mapFromSource(self.model.index(i,0))
-                    if index.isValid():
-                        self.table.selectRow(index.row())
-                    break
+        for i,row in enumerate(self.model.rows):
+            index = self.proxy.mapFromSource(self.model.index(i,0))
+            if index.isValid() and (row['_identity'] in expanded or self.search.text()):
+                self.table.setExpanded(index,True)
+            for child_index,node in [(None,row)]+list(enumerate(row.get('children',[]))):
+                if node['_identity'] != identity:
+                    continue
+                source = self.model.index(i,0) if child_index is None else self.model.index(child_index,0,self.model.index(i,0))
+                target = self.proxy.mapFromSource(source)
+                if target.isValid():
+                    self.table.selectionModel().select(target,QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
         self.table.verticalScrollBar().setValue(position)
         self.selection_changed()
         self.update_status()
 
     def update_status(self):
-        self.status.setText(f'{self.proxy.rowCount()} processi · CPU sul totale del sistema · rete per processo: non disponibile'+(' · Aggiornamento sospeso' if self.paused else ''))
+        self.status.setText(f"{getattr(self.model,'process_count',0)} processi · {self.proxy.rowCount()} applicazioni/voci · "+(self.latest.get('process_network_status','Rete in attesa') if self.latest else 'Rete in attesa')+(' · Aggiornamento sospeso' if self.paused else ''))
 
     def toggle_pause(self):
         self.paused = not self.paused

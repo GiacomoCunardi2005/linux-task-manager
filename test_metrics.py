@@ -57,6 +57,7 @@ MEMORY_DEVICE_1_PRESENT=0
 
     def test_real_linux_sample_has_consistent_memory_and_bounded_counters(self):
         monitor = Monitor()
+        self.addCleanup(monitor.close)
         first = monitor.sample()
         second = monitor.sample()
         for sample in (first,second):
@@ -64,7 +65,7 @@ MEMORY_DEVICE_1_PRESENT=0
             self.assertTrue(0 <= sample['cpu']['value'] <= 100)
             memory = sample['memory']
             self.assertEqual(memory['used']+memory['available'],memory['total'])
-            self.assertTrue(all(0 <= d['value'] <= 100 for d in sample['disks'].values()))
+            self.assertTrue(all(d['value'] is None or 0 <= d['value'] <= 100 for d in sample['disks'].values()))
             self.assertTrue(all(d['sent'] >= 0 and d['received'] >= 0 for d in sample['nets'].values()))
 
 

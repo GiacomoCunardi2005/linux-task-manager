@@ -7,20 +7,8 @@ import subprocess
 from collections import Counter
 import time
 import psutil
-
-
-def read(path, default=''):
-    try:
-        return Path(path).read_text().strip()
-    except (OSError, UnicodeError):
-        return default
-
-
-def number(path):
-    try:
-        return int(read(path))
-    except ValueError:
-        return None
+from process_network import ProcessNetwork
+from hardware import read, number, disk_devices, gpu_devices, npu_devices, wifi_link, link_details, network_identity
 
 
 def rate(current, previous, elapsed):
@@ -116,22 +104,16 @@ class Monitor:
         self.cpu_name = next((x.split(':', 1)[1].strip() for x in self.cpuinfo.splitlines() if x.startswith('model name')), 'CPU Linux')
         self.cpu_details = self._cpu_details()
         self.memory_hardware = memory_hardware()
-        self.disks = [p.name for p in sorted(Path('/sys/block').glob('*')) if not p.name.startswith(('loop', 'ram', 'zram', 'dm-'))]
-        self.nets = [name for name in psutil.net_io_counters(pernic=True) if name != 'lo']
-        self.gpus = []
-        for card in sorted(Path('/sys/class/drm').glob('card[0-9]*')):
-            if not re.fullmatch(r'card\d+', card.name):
-                continue
-            device = card / 'device'
-            vendor = read(device / 'vendor')
-            brand = {'0x8086': 'Intel Graphics', '0x1002': 'AMD Radeon', '0x10de': 'NVIDIA'}.get(vendor, 'GPU')
-            self.gpus.append({'card': card, 'name': brand, 'pci': device.resolve().name, 'driver': (device / 'driver').resolve().name})
         self.last_time = time.monotonic()
-        self.last_disks = psutil.disk_io_counters(perdisk=True)
-        self.last_net = psutil.net_io_counters(pernic=True)
+        self.last_disks = psutil.disk_io_counters(perdisk=True,nowrap=False)
+        self.last_net = psutil.net_io_counters(pernic=True,nowrap=False)
+        self.last_net_ids = {name:network_identity(name) for name in self.last_net}
         self.last_gpu = {}
+        self.last_disk_ids = {}
+        self.last_npu = {}
         self.last_processes = {}
         self.last_cpu = psutil.cpu_times(percpu=True)
+        self.process_network = ProcessNetwork()
 
     def _cpu_details(self):
         sockets = set(re.findall(r'^physical id\s*:\s*(.+)$', self.cpuinfo, re.M))
@@ -193,7 +175,7 @@ class Monitor:
             try:
                 proc = psutil.Process(pid)
                 info = proc.as_dict(['pid','name','create_time','cpu_times','memory_info',
-                                     'status','username','uids','num_threads','io_counters'])
+                                     'status','username','uids','num_threads','io_counters','exe','cmdline','ppid'])
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
             processes += 1
@@ -206,7 +188,7 @@ class Monitor:
             old_cpu,old_io = self.last_processes.get(identity,(None,None))
             previous[identity] = (cpu_time,io_bytes)
             rows.append({'pid':pid, 'created':info['create_time'], 'name':info['name'] or str(pid),
-                'status':info['status'], 'user':info['username'] or 'Non disponibile',
+                'status':info['status'], 'ppid':info['ppid'], 'exe':info['exe'], 'cmdline':info['cmdline'] or [], 'user':info['username'] or 'Non disponibile',
                 'uid':info['uids'].real if info['uids'] else None,
                 'cpu': min(100,rate(cpu_time,old_cpu,dt)*100/max(1,len(times))) if cpu_time is not None and old_cpu is not None else None,
                 'memory':info['memory_info'].rss if info['memory_info'] else None,
@@ -221,35 +203,61 @@ class Monitor:
                              'shared': getattr(mem, 'shared', 0), 'swap': swap.used, 'swap_total': swap.total,
                              'committed':meminfo.get('Committed_AS'), 'commit_limit':meminfo.get('CommitLimit'),
                              'slab_reclaimable':meminfo.get('SReclaimable'), 'slab_unreclaimable':meminfo.get('SUnreclaim')},
-                  'disks': {}, 'nets': {}, 'gpus': {}, 'process_rows': rows}
-        disks = psutil.disk_io_counters(perdisk=True)
-        for name in self.disks:
+                  'disks': {}, 'nets': {}, 'gpus': {}, 'npus': {}, 'process_rows': rows}
+        disks = psutil.disk_io_counters(perdisk=True,nowrap=False)
+        metadata = disk_devices()
+        for name,device in metadata.items():
             cur, prev = disks.get(name), self.last_disks.get(name)
-            if not cur or not prev:
+            ready = cur is not None and prev is not None and self.last_disk_ids.get(name) == device['identity']
+            ios = max(0,cur.read_count+cur.write_count-prev.read_count-prev.write_count) if ready else 0
+            result['disks'][name] = {**device,
+                'value':min(100,rate(cur.busy_time,prev.busy_time,dt)/10) if ready else None,
+                'read':rate(cur.read_bytes,prev.read_bytes,dt) if ready else None,
+                'write':rate(cur.write_bytes,prev.write_bytes,dt) if ready else None,
+                'latency':max(0,cur.read_time+cur.write_time-prev.read_time-prev.write_time)/ios if ios else (0 if ready else None)}
+        for partition in psutil.disk_partitions():
+            if not partition.device.startswith('/dev/'):
                 continue
-            ios = max(0, cur.read_count+cur.write_count-prev.read_count-prev.write_count)
-            result['disks'][name] = {'value': min(100, rate(cur.busy_time, prev.busy_time, dt)/10),
-                'read': rate(cur.read_bytes, prev.read_bytes, dt), 'write': rate(cur.write_bytes, prev.write_bytes, dt),
-                'latency': max(0, cur.read_time+cur.write_time-prev.read_time-prev.write_time)/ios if ios else 0,
-                'capacity': (number(f'/sys/block/{name}/size') or 0)*512,
-                'model': read(f'/sys/block/{name}/device/model', name),
-                'type': 'HDD' if read(f'/sys/block/{name}/queue/rotational') == '1' else 'SSD'}
-        nets = psutil.net_io_counters(pernic=True)
+            block = Path('/sys/class/block')/Path(partition.device).name
+            parent = block.resolve().parent.name
+            name = block.name if block.name in result['disks'] else parent
+            if name in result['disks']:
+                result['disks'][name].setdefault('mounts',[]).append(f'{partition.mountpoint} ({partition.fstype})')
+        self.last_disk_ids = {name:d['identity'] for name,d in metadata.items()}
+        nets = psutil.net_io_counters(pernic=True,nowrap=False)
         addresses = psutil.net_if_addrs()
         states = psutil.net_if_stats()
-        for name in self.nets:
-            cur, prev = nets.get(name), self.last_net.get(name)
-            if not cur or not prev:
+        for name in sorted(nets):
+            if name == 'lo':
                 continue
+            cur, prev = nets.get(name), self.last_net.get(name)
+            if not cur:
+                continue
+            identity = network_identity(name)
+            if self.last_net_ids.get(name) != identity or (prev and (cur.bytes_sent < prev.bytes_sent or cur.bytes_recv < prev.bytes_recv)):
+                prev = None
+            prev = prev or cur
             sent = rate(cur.bytes_sent, prev.bytes_sent, dt)*8
             received = rate(cur.bytes_recv, prev.bytes_recv, dt)*8
             result['nets'][name] = {'value': max(sent, received), 'sent': sent, 'received': received,
                 'ipv4': next((a.address for a in addresses.get(name, []) if a.family == socket.AF_INET), 'Non disponibile'),
                 'ipv6': next((a.address.split('%')[0] for a in addresses.get(name, []) if a.family == socket.AF_INET6), 'Non disponibile'),
-                'connected': bool(states.get(name) and states[name].isup),
-                'wifi': Path(f'/sys/class/net/{name}/wireless').exists()}
-        clients = self._gpu_clients() if self.gpus else {}
-        for index, gpu in enumerate(self.gpus):
+                'connected': bool(states.get(name) and states[name].isup and read(f'/sys/class/net/{name}/carrier') != '0'),
+                'wifi': Path(f'/sys/class/net/{name}/wireless').exists(),
+                'identity':identity,
+                'speed':states[name].speed if name in states and states[name].speed > 0 else None,
+                'duplex':{psutil.NIC_DUPLEX_FULL:'Full duplex',psutil.NIC_DUPLEX_HALF:'Half duplex'}.get(states[name].duplex) if name in states else None,
+                'mtu':states[name].mtu if name in states else None,
+                'mac':next((a.address for a in addresses.get(name,[]) if a.family == psutil.AF_LINK),None),
+                'driver':(Path(f'/sys/class/net/{name}/device/driver').resolve().name if Path(f'/sys/class/net/{name}/device/driver').exists() else None),
+                'link':link_details(Path(f'/sys/class/net/{name}/device'))}
+            if result['nets'][name]['wifi']:
+                result['nets'][name].update(wifi_link(name))
+        result['process_network_status'] = self.process_network.sample(rows,[(name,d['identity']) for name,d in result['nets'].items() if d['connected']])
+        self.last_net_ids = {name:d['identity'] for name,d in result['nets'].items()}
+        gpus = gpu_devices()
+        clients = self._gpu_clients() if gpus else {}
+        for gpu in gpus:
             device = gpu['card'] / 'device'
             busy = number(device / 'gpu_busy_percent')
             engines = {}
@@ -264,12 +272,23 @@ class Monitor:
                         engines[engine] = engines.get(engine, 0) + rate(value, old, dt)/1e7
             if busy is None and found and engines:
                 busy = min(100, max(engines.values()))
-            result['gpus'][str(index)] = {'value': busy, 'engines': {k:min(100,v) for k,v in engines.items()},
+            result['gpus'][gpu['card'].name] = {'value': busy, 'engines': {k:min(100,v) for k,v in engines.items()},
                 'vram': number(device / 'mem_info_vram_used'), 'vram_total': number(device / 'mem_info_vram_total'),
                 'freq': number(gpu['card'] / 'gt_cur_freq_mhz'), 'driver': gpu['driver'],
+                'identity':str(device.resolve()),
                 'pci': gpu['pci'], 'name': gpu['name'], 'partial': not (device / 'gpu_busy_percent').exists()}
+        npus = npu_devices()
+        for name,device in npus.items():
+            previous = self.last_npu.get(name)
+            ready = previous is not None and previous['identity'] == device['identity'] and device['busy'] is not None and previous['busy'] is not None and device['busy'] >= previous['busy']
+            result['npus'][name] = {**device,'value':min(100,rate(device['busy'],previous['busy'],dt)/10000) if ready else None}
+        self.last_npu = npus
         self.last_time, self.last_disks, self.last_net, self.last_gpu = now, disks, nets, clients
         return result
+
+
+    def close(self):
+        self.process_network.close()
 
 
 def terminate_process(pid, created):

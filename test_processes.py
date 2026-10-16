@@ -8,9 +8,10 @@ import unittest
 from unittest.mock import patch
 import psutil
 from PySide6.QtGui import QIcon
-from PySide6.QtCore import Qt
+from PySide6.QtTest import QAbstractItemModelTester
+from PySide6.QtCore import Qt, QItemSelectionModel
 from PySide6.QtWidgets import QApplication, QMessageBox
-from processes import ProcessModel
+from processes import ProcessModel, process_groups
 from metrics import Monitor, terminate_process
 import test_ui
 from test_ui import wait
@@ -39,8 +40,60 @@ class ProcessTests(unittest.TestCase):
         finally:
             QIcon.setThemeSearchPaths(paths)
 
+    def test_application_groups_aggregate_and_separate_interpreters(self):
+        base = dict(created=1.,status='sleeping',user='test',uid=1000,cpu=1.,memory=1024,disk=10,network=100)
+        rows = [dict(base,pid=1,name='codex',exe='/one/codex',ppid=0),
+                dict(base,pid=2,name='codex',exe='/two/codex',ppid=0),
+                dict(base,pid=3,name='codex-helper',exe='/two/codex-helper',ppid=2),
+                dict(base,pid=4,name='python',exe='/usr/bin/python',cmdline=['python','first.py']),
+                dict(base,pid=5,name='python',exe='/usr/bin/python',cmdline=['python','second.py'])]
+        groups = process_groups(rows)
+        self.assertEqual(len(groups),3)
+        group = groups[0]
+        self.assertEqual(group['name'],'codex')
+        self.assertEqual(group['cpu'],3.)
+        self.assertEqual(group['memory'],3072)
+        self.assertEqual(group['network'],300)
+        self.assertEqual([row['pid'] for row in group['children']],[1,2,3])
+        self.assertNotIn('_parent',rows[0])
+
+    def test_group_expansion_child_selection_and_pid_filter_survive_refresh(self):
+        window = Window()
+        window.show()
+        try:
+            wait(1400)
+            window.timer.stop()
+            window.sampler.wait()
+            self.app.processEvents()
+            page = window.process_page
+            base = dict(created=1.,status='sleeping',user='test',uid=os.getuid(),cpu=1.,memory=1024,disk=0,network=100,exe='/opt/codex')
+            rows = [dict(base,pid=987651,name='codex'),dict(base,pid=987652,name='codex')]
+            data = dict(window.snapshot,process_rows=rows)
+            tester = QAbstractItemModelTester(page.model,QAbstractItemModelTester.FailureReportingMode.Fatal)
+            page.receive(data)
+            root = page.proxy.index(0,0)
+            self.assertEqual(root.data(),'codex (2)')
+            page.table.setExpanded(root,True)
+            page.table.selectionModel().select(root,QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+            self.assertFalse(page.end_task.isEnabled())
+            child = page.proxy.index(1,0,root)
+            page.table.selectionModel().select(child,QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+            self.assertEqual(page.selected()['pid'],987652)
+            page.receive(dict(data,process_rows=list(reversed(rows))))
+            self.assertEqual(page.selected()['pid'],987652)
+            self.assertTrue(page.table.isExpanded(page.proxy.index(0,0)))
+            page.search.setText('987652')
+            self.assertEqual(page.proxy.rowCount(),1)
+            self.assertEqual(page.proxy.rowCount(page.proxy.index(0,0)),1)
+            page.search.clear()
+            self.app.processEvents()
+            window.grab().save('reference/linux-processes-group-fixture.png')
+        finally:
+            window.close()
+
     def test_live_rows_and_cpu_warmup(self):
         monitor = Monitor()
+        self.addCleanup(monitor.close)
         first = monitor.sample()
         self.assertTrue(first['process_rows'])
         self.assertTrue(all(p['cpu'] is None for p in first['process_rows']))
@@ -78,7 +131,7 @@ class ProcessTests(unittest.TestCase):
             self.assertEqual(window.pages.currentIndex(),0)
             self.assertTrue(window.navbuttons[0][0].isChecked())
             page = window.process_page
-            self.assertEqual(page.table.verticalHeader().defaultSectionSize(),30)
+            self.assertEqual(page.table.sizeHintForRow(0),30)
             data = window.snapshot
             self.assertIsNotNone(data)
             rows = [dict(pid=987654+i,created=1.,name=name,status='sleeping',user='test',uid=os.getuid(),cpu=cpu,memory=memory,disk=0.) for i,(name,cpu,memory) in enumerate([('app.test',2.,1024),('Another',12.,2048)])]
@@ -91,7 +144,7 @@ class ProcessTests(unittest.TestCase):
             page.search.setText('does-not-exist')
             self.assertEqual(page.proxy.rowCount(),0)
             page.search.clear()
-            page.table.selectRow(0)
+            page.table.selectionModel().select(page.proxy.index(0,0),QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
             identity = page.selected()['pid']
             page.receive(dict(data,process_rows=list(reversed(rows))))
             self.assertEqual(page.selected()['pid'],identity)

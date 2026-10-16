@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, 
 from metrics import Monitor, read, size, percent, uptime
 from processes import ProcessPage
 
-COLORS = {'cpu':'#42a7bf', 'memory':'#8b8fd7', 'disks':'#9bc86b', 'nets':'#d48bbb', 'gpus':'#aa92d0'}
+COLORS = {'cpu':'#42a7bf', 'memory':'#8b8fd7', 'disks':'#9bc86b', 'nets':'#d48bbb', 'gpus':'#aa92d0', 'npus':'#d4a5db'}
 ICON_PATHS = {
  'menu':'M4 6h16M4 12h16M4 18h16',
  'performance':'M3 3h18v18H3z M5 13h4l2-6 3 11 2-5h3',
@@ -43,6 +43,7 @@ def icon(name, color='#eeeeee'):
 
 def label(text='', pixels=12, color='#eeeeee'):
     widget = QLabel(text)
+    widget.setTextFormat(Qt.PlainText)
     widget.setStyleSheet(f'color:{color}; font-size:{pixels}px; background:transparent;')
     return widget
 
@@ -273,13 +274,11 @@ class Window(QWidget):
         resource_scroll.setObjectName('resources')
         resources = QWidget()
         resource_layout = QVBoxLayout(resources)
+        self.resource_layout = resource_layout
         resource_layout.setContentsMargins(4,6,4,6)
         resource_layout.setSpacing(0)
         self.resources = {}
         entries = [('cpu','cpu','CPU'),('memory','memory','Memoria')]
-        entries += [('disks',n,f'Disco {i} ({n})') for i,n in enumerate(self.monitor.disks)]
-        entries += [('nets',n,'Wi-Fi' if Path(f'/sys/class/net/{n}/wireless').exists() else 'Ethernet') for n in self.monitor.nets]
-        entries += [('gpus',str(i),f'GPU {i}') for i in range(len(self.monitor.gpus))]
         for kind,key,title in entries:
             resource = Resource(title,COLORS[kind])
             resource.clicked.connect(lambda checked=False,k=kind,n=key: self.select(k,n))
@@ -376,19 +375,60 @@ class Window(QWidget):
             button.setText('' if collapsed else text)
             button.setToolTip(text if collapsed else ('Questa versione comprende la scheda Prestazioni' if not button.isEnabled() else text))
 
+    def sync_resources(self,data):
+        entries = [('cpu','cpu','CPU'),('memory','memory','Memoria')]
+        entries += [('disks',name,f'Disco {i} ({name})') for i,name in enumerate(data['disks'])]
+        entries += [('nets',name,'Wi-Fi' if device['wifi'] else 'Ethernet') for name,device in data['nets'].items()]
+        entries += [('gpus',name,f'GPU {i}') for i,name in enumerate(data['gpus'])]
+        entries += [('npus',name,f'NPU {i}') for i,name in enumerate(data['npus'])]
+        wanted = {(kind,key) for kind,key,_ in entries}
+        reset = set(self.resources)-wanted
+        for kind,key,_ in entries:
+            if kind in ('disks','nets','gpus','npus'):
+                old = getattr(self,'device_ids',{}).get((kind,key))
+                identity = data[kind][key]['identity']
+                if old is not None and old != identity:
+                    reset.add((kind,key))
+        for kind,key in reset:
+            button = self.resources.pop((kind,key))
+            self.resource_layout.removeWidget(button)
+            button.hide()
+            button.deleteLater()
+            fields = (kind,'disk-read','disk-write') if kind == 'disks' else (kind,'sent','received') if kind == 'nets' else (kind,f'gpu-{key}')
+            for history_key in list(self.histories):
+                if history_key[0] in fields and (history_key[1] == key or history_key[0] == f'gpu-{key}'):
+                    self.histories.pop(history_key)
+        for index,(kind,key,title) in enumerate(entries):
+            if (kind,key) not in self.resources:
+                button = Resource(title,COLORS[kind])
+                button.clicked.connect(lambda checked=False,k=kind,n=key: self.select(k,n))
+                self.resources[(kind,key)] = button
+            button = self.resources[(kind,key)]
+            if button.full_title != title:
+                button.full_title = title
+                button.setAccessibleName(title)
+                button.title.setText(button.title.fontMetrics().elidedText(title,Qt.ElideRight,max(40,button.width()-88)))
+            if self.resource_layout.indexOf(button) != index:
+                self.resource_layout.insertWidget(index,button)
+            button.setChecked((kind,key) == self.selection)
+        self.device_ids = {(kind,key):d['identity'] for kind in ('disks','nets','gpus','npus') for key,d in data[kind].items()}
+        if self.selection not in wanted or self.selection in reset:
+            self.select('cpu','cpu')
+
     def poll(self):
         if not self.sampler.isRunning():
             self.sampler.start()
 
     def receive(self,data):
         self.snapshot = data
+        self.sync_resources(data)
         self.process_page.receive(data)
         now = time.monotonic()
         for kind in ('cpu','memory'):
             self.histories[(kind,kind)].append((now,data[kind]['value']))
         for i,v in enumerate(data['cpu']['cores']):
             self.histories[('core',str(i))].append((now,v))
-        for kind in ('disks','nets','gpus'):
+        for kind in ('disks','nets','gpus','npus'):
             for key,values in data[kind].items():
                 self.histories[(kind,key)].append((now,values['value']))
                 if kind == 'gpus':
@@ -440,7 +480,7 @@ class Window(QWidget):
         self.graphs = []
         for i in range(count):
             graph = Graph(COLORS[kind])
-            graph.setMinimumSize(50,45)
+            graph.setMinimumSize(50,160 if count == 1 else 45)
             graph.setToolTip(f'Processore logico {i}' if count > 1 else 'Ultimi 60 secondi')
             self.charts.addWidget(graph,i//cols,i%cols)
             self.graphs.append(graph)
@@ -480,7 +520,7 @@ class Window(QWidget):
         kind,key = self.selection
         d = data[kind] if kind in ('cpu','memory') else data[kind].get(key)
         if d is None:
-            self.notice.setText('Dispositivo non disponibile. Ricollegalo e riavvia l’app.')
+            self.notice.setText('Dispositivo non disponibile. In attesa del rilevamento automatico.')
             return
         self.notice.setText('')
         self.composition.setVisible(kind == 'memory')
@@ -518,17 +558,43 @@ class Window(QWidget):
             self.heading.setText(self.resources[(kind,key)].full_title.split(' (')[0])
             self.device.setText(d['model'])
             self.chart_label.setText('Tempo di attività')
-            values = [('Tempo di attività',percent(d['value'])),('Risposta media',f"{d['latency']:.1f} ms"),('Velocità lettura',size(d['read'])+'/s'),('Velocità scrittura',size(d['write'])+'/s')]
-            details = [('Capacità:',size(d['capacity'])),('Tipo:',d['type']),('Dispositivo:',f'/dev/{key}')]
+            values = [('Tempo di attività',percent(d['value'])),('Risposta media',f"{d['latency']:.1f} ms" if d['latency'] is not None else 'Non disponibile'),('Velocità lettura',size(d['read'])+'/s' if d['read'] is not None else 'Non disponibile'),('Velocità scrittura',size(d['write'])+'/s' if d['write'] is not None else 'Non disponibile')]
+            details = [('Capacità:',size(d['capacity'])),('Tipo:',d['type']),('Dispositivo:',f'/dev/{key}'),('Collegamento:',d['bus'] or 'Non disponibile'),
+                ('Velocità negoziata:',d['link_speed'] or 'Non disponibile'),('Rimovibile:', 'Sì' if d['removable'] else 'No'),
+                ('Montaggi:',', '.join(d.get('mounts',[])) or 'Non montato')]
+            if d['bus'] == 'USB':
+                details += [('Versione USB dichiarata:',d.get('usb_version') or 'Non disponibile'),('Prodotto USB:',d.get('usb_product') or 'Non disponibile')]
+            self.notice.setText('La velocità negoziata è quella del collegamento, distinta dal trasferimento effettivo. Primo campione: in attesa dei contatori.' if d['value'] is None else 'La velocità negoziata del collegamento è distinta dalla velocità effettiva di lettura e scrittura.')
         elif kind == 'nets':
             self.heading.setText('Wi-Fi' if d['wifi'] else 'Ethernet')
             self.device.setText(key)
             self.chart_label.setText('Velocità effettiva')
             values = [('Invio',bitrate(d['sent'])),('Ricezione',bitrate(d['received']))]
-            details = [('Nome scheda:',key),('Tipo di connessione:','Wi-Fi' if d['wifi'] else 'Ethernet / virtuale'),('Indirizzo IPv4:',d['ipv4']),('Indirizzo IPv6:',d['ipv6'])]
-            self.notice.setText('Linea continua: ricezione · linea tratteggiata: invio' if d['connected'] else 'Disconnesso')
+            details = [('Nome scheda:',key),('Tipo di connessione:','Wi-Fi' if d['wifi'] else 'Ethernet / virtuale'),
+                ('Velocità collegamento:',bitrate(d['speed']*1e6) if d['speed'] else 'Non disponibile'),
+                ('Duplex:',d['duplex'] or 'Non disponibile'),('MTU:',str(d['mtu']) if d['mtu'] else 'Non disponibile'),
+                ('Indirizzo IPv4:',d['ipv4']),('Indirizzo IPv6:',d['ipv6']),('Indirizzo MAC:',d['mac'] or 'Non disponibile'),
+                ('Driver:',d['driver'] or 'Non disponibile')]
+            if d['wifi']:
+                details = [(name,d.get(field) or 'Non disponibile') for name,field in (
+                    ('Rete (SSID):','ssid'),('Standard Wi-Fi:','standard'),('Banda:','band'),('Frequenza:','frequency'),
+                    ('Canale:','channel'),('Larghezza canale:','width'),('Segnale:','signal'),
+                    ('Bitrate RX (radio):','rx_rate'),('Bitrate TX (radio):','tx_rate'),('Punto di accesso:','bssid'))]+[item for item in details if item[0] not in ('Velocità collegamento:','Duplex:')]
+            if d['link']['bus'] == 'USB':
+                details += [('Collegamento USB:',d['link']['link_speed'] or 'Non disponibile')]
+            self.notice.setText('Traffico effettivo: linea continua RX, tratteggiata TX. I bitrate radio e la velocità del collegamento non sono la velocità Internet.' if d['connected'] else 'Disconnesso')
+        elif kind == 'npus':
+            self.heading.setText(self.resources[(kind,key)].full_title)
+            self.device.setText(d['name'])
+            self.chart_label.setText('% di utilizzo NPU')
+            values = [('Utilizzo',percent(d['value'])),('Memoria NPU',size(d['memory'])),
+                ('Frequenza',f"{d['freq']} MHz" if d['freq'] is not None else 'Non disponibile')]
+            details = [('Driver:',d['driver']),('Bus PCI:',d['pci']),
+                ('Frequenza massima:',f"{d['max_freq']} MHz" if d['max_freq'] is not None else 'Non disponibile'),
+                ('Stato:',{'active':'Attiva','suspended':'Sospesa'}.get(d['state'],d['state'] or 'Non disponibile'))]
+            self.notice.setText('Utilizzo reale dal tempo di esecuzione dei job del driver; memoria dei buffer residenti della NPU.' if d['value'] is not None else 'Il driver non espone un contatore di utilizzo NPU accessibile.' if d['busy'] is None else 'In attesa di due campioni del contatore NPU.')
         else:
-            self.heading.setText(f'GPU {key}')
+            self.heading.setText(self.resources[(kind,key)].full_title)
             self.device.setText(d['name'])
             self.chart_label.setText('Utilizzo GPU')
             values = [('Utilizzo',percent(d['value'])),('Memoria dedicata',size(d['vram'])),('Frequenza',f"{d['freq']} MHz" if d['freq'] is not None else 'N/D')]
@@ -552,7 +618,7 @@ class Window(QWidget):
             if kind == 'disks' and i == 1:
                 graph.samples = list(self.histories[('disk-read',key)])
                 graph.secondary = list(self.histories[('disk-write',key)])
-                graph.maximum = max(1024, max((v for _,v in graph.samples+graph.secondary),default=0)*1.1)
+                graph.maximum = max(1024, max((v for _,v in graph.samples+graph.secondary if v is not None),default=0)*1.1)
                 graph.caption = 'Lettura / scrittura · '+size(graph.maximum)+'/s'
             elif kind == 'gpus':
                 engines = list(d['engines'])
@@ -568,6 +634,10 @@ class Window(QWidget):
         signature = tuple(k for k,_ in values), tuple(k for k,_ in details)
         if getattr(self,'stats_signature',None) == signature:
             for widget,(_,value) in zip(self.value_labels,values):
+                small = len(value) >= 17 or value == 'Non disponibile'
+                was_small = len(widget.text()) >= 17 or widget.text() == 'Non disponibile'
+                if small != was_small:
+                    widget.setStyleSheet(f'color:#eeeeee; font-size:{14 if small else 20}px; background:transparent;')
                 widget.setText(value)
             for widget,(_,value) in zip(self.detail_labels,details):
                 widget.setText(value)
@@ -589,7 +659,7 @@ class Window(QWidget):
             column.setContentsMargins(0,0,0,0)
             column.setSpacing(3)
             column.addWidget(label(name,11,'#cccccc'))
-            value_label = label(value,20 if len(value)<17 else 14)
+            value_label = label(value,20 if len(value)<17 and value != 'Non disponibile' else 14)
             self.value_labels.append(value_label)
             column.addWidget(value_label)
             if self.selection[0] == 'cpu':
@@ -628,6 +698,7 @@ class Window(QWidget):
     def closeEvent(self,event):
         self.timer.stop()
         self.sampler.wait()
+        self.monitor.close()
         event.accept()
 
 
@@ -666,9 +737,9 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
 #process-page { background:#191919; }
 QLineEdit { background:#292929; border:1px solid #444444; border-bottom:1px solid #aaaaaa; border-radius:4px; padding:8px; }
 QLineEdit:focus { border-bottom:2px solid #d48bbb; }
-QTableView { background:#191919; border:none; selection-background-color:#414141; selection-color:#ffffff; }
-QTableView::item { padding:0 8px; border:none; }
-QTableView::item:selected { background:#414141; color:white; }
+QTreeView { background:#191919; border:none; selection-background-color:#414141; selection-color:#ffffff; }
+QTreeView::item { padding:0 8px; border:none; height:30px; }
+QTreeView::item:selected { background:#414141; color:white; }
 QHeaderView::section { background:#202020; color:#eeeeee; border:none; border-right:1px solid #353535; border-bottom:1px solid #353535; padding:6px 8px; }
 QMenu { background:#2b2b2b; border:1px solid #444444; padding:4px; }
 QMenu::item { padding:8px 24px; }
