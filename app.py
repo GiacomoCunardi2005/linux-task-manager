@@ -495,13 +495,25 @@ class Window(QWidget):
             details = self.monitor.cpu_details
         elif kind == 'memory':
             self.heading.setText('Memoria')
-            self.device.setText(size(d['total']))
+            hardware = self.monitor.memory_hardware
+            self.device.setText(size(hardware['installed'] or d['total']))
             self.chart_label.setText('Utilizzo memoria')
             self.scale.setText(size(d['total']))
             self.composition.setValue(round(d['value']*10))
             self.composition.setToolTip(f"In uso: {size(d['used'])} · disponibile: {size(d['available'])}")
-            values = [('In uso',size(d['used'])),('Disponibile',size(d['available'])),('Cache',size(d['cached'])),('Swap in uso',size(d['swap']))]
-            details = [('Totale:',size(d['total'])),('Buffer:',size(d['buffers'])),('Memoria condivisa:',size(d['shared'])),('Swap totale:',size(d['swap_total']))]
+            committed = size(d['committed'])+' / '+size(d['commit_limit']) if d['committed'] is not None and d['commit_limit'] is not None else 'Non disponibile'
+            values = [('In uso',size(d['used'])),('Disponibile',size(d['available'])),
+                ('Impegnata / limite',committed),('Cache',size(d['cached'])),
+                ('Slab recuperabile',size(d['slab_reclaimable'])),('Slab non recuperabile',size(d['slab_unreclaimable']))]
+            slots = f"{hardware['slots_used']} di {hardware['slots_total']}" if hardware['slots_used'] is not None and hardware['slots_total'] is not None else 'Non disponibile'
+            reserved = hardware['installed']-d['total'] if hardware['installed'] is not None and hardware['installed'] >= d['total'] else None
+            details = [('Velocità:',hardware['speed'] or 'Non disponibile'),
+                ('Slot utilizzati:',slots),('Fattore di forma:',hardware['form_factor'] or 'Non disponibile'),
+                ('Tipo:',hardware['type'] or 'Non disponibile'),('Moduli:',hardware['modules'] or 'Non disponibile'),
+                ('Riservata al sistema:',size(reserved)),('Utilizzabile da Linux:',size(d['total'])),
+                ('Swap in uso / totale:',size(d['swap'])+' / '+size(d['swap_total'])),
+                ('Buffer:',size(d['buffers'])),('Memoria condivisa:',size(d['shared']))]
+            self.notice.setText('Velocità configurata dal firmware, in MT/s. Riservata al sistema: RAM installata meno memoria utilizzabile da Linux. Impegno e limite seguono la politica di overcommit Linux.')
         elif kind == 'disks':
             self.heading.setText(self.resources[(kind,key)].full_title.split(' (')[0])
             self.device.setText(d['model'])

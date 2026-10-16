@@ -11,3 +11,5 @@ User correction: keep only Processi and Prestazioni in the collapsible navigatio
 ## Processes view
 
 Extend the same Windows 11 dark world. Reference: reference/windows11-processes.jpg. Main pane uses search, 50px action toolbar, 50px two-line resource headers with live totals, 30px rows, flat dark background, burgundy heat cells for CPU/memory/disk/network. Name and status left; metrics right; Linux PID appended. Theme icons resolved through installed desktop files and XDG icon directories. Flat per-process rows avoid inventing Windows app groups from Linux process names. Search and stable identity selection persist through live updates; stopping a task always names its identity and asks about unsaved data.
+
+Memory statistics include configured RAM speed, used slots, form factor, type and module capacities from cached udev SMBIOS data. Installed capacity is distinguished from Linux usable memory; commitment and slab use their actual Linux meanings. Missing firmware data stays unavailable, never inferred from the CPU or RAM model.

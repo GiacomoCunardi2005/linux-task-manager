@@ -22,7 +22,7 @@ Per aggiungerla al menu applicazioni dell'utente:
 
 - Processi: tabella in tempo reale, ricerca per nome/PID/utente, ordinamento numerico, CPU, memoria RSS, I/O disco e stato; terminazione del singolo processo del proprio utente con conferma e controllo dell’identità PID + data di avvio.
 - CPU totale e per processore logico, frequenza, processi, thread, file allocati dal kernel, uptime, topologia e cache.
-- RAM, memoria disponibile, cache, buffer, memoria condivisa e swap; grafico e composizione della memoria.
+- RAM: velocità configurata in MT/s, slot utilizzati, tipo DDR, formato e capacità dei moduli, memoria installata e utilizzabile, impegno/limite Linux, slab recuperabile e non recuperabile, cache, buffer, memoria condivisa e swap; grafico e composizione della memoria.
 - Dischi: tempo di attività, letture/scritture, latenza media delle operazioni completate, capacità e modello.
 - Rete: invio/ricezione per interfaccia, scala automatica e indirizzi IPv4/IPv6.
 - GPU DRM: motori accessibili tramite fdinfo, utilizzo sysfs quando presente, VRAM e frequenza se esposte dal driver.
@@ -53,3 +53,5 @@ Per rimuovere il collegamento dal menu, eliminare `~/.local/share/applications/l
 La pagina Processi è verificata anche con ricerca letterale, ordinamento numerico, selezione stabile, pausa e annullamento/conferma della terminazione; il test dei segnali termina solo un sottoprocesso di prova. Le icone dei processi provengono dai file `.desktop` e dal tema di icone installato. Per fissare l’app alla barra, installare il collegamento e scegliere «Aggiungi ai preferiti» dal menu dell’icona.
 
 Fonte visiva aggiuntiva: [schermata Windows 11 di Lonely Mobiler](https://loumo.jp/archives/28065).
+
+I dettagli hardware della RAM si leggono una sola volta dalla cache udev (`udevadm info` sul dispositivo DMI), senza sudo. Su sistemi senza udev o con firmware incompleto restano «Non disponibile». La velocità configurata non viene sostituita dalla velocità massima nominale. «Riservata al sistema» è la differenza tra RAM installata secondo il firmware e MemTotal Linux, non una misura separata della sola riserva hardware. I valori Impegnata/limite e slab sono contatori Linux, diversi dai pool di Windows.

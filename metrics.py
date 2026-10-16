@@ -3,6 +3,8 @@ from pathlib import Path
 import re
 import os
 import socket
+import subprocess
+from collections import Counter
 import time
 import psutil
 
@@ -54,11 +56,66 @@ def uptime(seconds):
     return f'{days}:{hours:02}:{minutes:02}:{seconds:02}'
 
 
+def parse_memory_hardware(properties):
+    """Decode systemd's cached SMBIOS properties, never infer missing modules."""
+    devices = {}
+    slots = None
+    for line in properties.splitlines():
+        key, separator, value = line.partition('=')
+        if not separator:
+            continue
+        if key == 'MEMORY_ARRAY_NUM_DEVICES' and value.isdecimal():
+            slots = int(value) or None
+        match = re.fullmatch(r'MEMORY_DEVICE_(\d+)_(SIZE|PRESENT|FORM_FACTOR|TYPE|CONFIGURED_SPEED_MTS|SPEED_MTS)',key)
+        if match:
+            devices.setdefault(match[1],{})[match[2]] = value.strip()
+    def positive(value):
+        return int(value) if value and value.isdecimal() and int(value) > 0 else None
+    populated = [device for device in devices.values() if positive(device.get('SIZE')) or device.get('PRESENT') == '1']
+    complete = bool(devices) and all(positive(d.get('SIZE')) or d.get('PRESENT') == '0' for d in devices.values())
+    complete = complete and slots is not None and len(devices) == slots
+    def summary(key, numeric=False):
+        values = [d.get(key) for d in populated]
+        if not complete or not values or any(not v or v in ('Unknown','Other','<OUT OF SPEC>','Not Specified') for v in values):
+            return None
+        if numeric:
+            numbers = [positive(v) for v in values]
+            return ' / '.join(str(v) for v in sorted(set(numbers)))+' MT/s' if all(numbers) else None
+        return ' / '.join(sorted(set(values))).replace('SODIMM','SO-DIMM')
+    capacities = [positive(d.get('SIZE')) for d in populated]
+    installed = sum(capacities) if complete and capacities and all(capacities) else None
+    modules = ', '.join(f'{count} × {size(capacity)}' for capacity,count in sorted(Counter(capacities).items())) if installed else None
+    return {'speed':summary('CONFIGURED_SPEED_MTS',True), 'rated_speed':summary('SPEED_MTS',True),
+        'type':summary('TYPE'), 'form_factor':summary('FORM_FACTOR'),
+        'slots_used':len(populated) if complete else None, 'slots_total':slots,
+        'installed':installed, 'modules':modules}
+
+
+def memory_hardware():
+    try:
+        result = subprocess.run(['udevadm','info','--query=property','--path=/sys/devices/virtual/dmi/id'],
+            capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=2)
+        return parse_memory_hardware(result.stdout if result.returncode == 0 else '')
+    except (OSError,subprocess.TimeoutExpired):
+        return parse_memory_hardware('')
+
+
+def memory_counters():
+    fields = {}
+    for line in read('/proc/meminfo').splitlines():
+        key,_,value = line.partition(':')
+        parts = value.split()
+        if len(parts) == 2 and parts[1] == 'kB' and parts[0].isdecimal():
+            fields[key] = int(parts[0])*1024
+    return fields
+
+
 class Monitor:
     def __init__(self):
         self.cpuinfo = read('/proc/cpuinfo')
         self.cpu_name = next((x.split(':', 1)[1].strip() for x in self.cpuinfo.splitlines() if x.startswith('model name')), 'CPU Linux')
         self.cpu_details = self._cpu_details()
+        self.memory_hardware = memory_hardware()
         self.disks = [p.name for p in sorted(Path('/sys/block').glob('*')) if not p.name.startswith(('loop', 'ram', 'zram', 'dm-'))]
         self.nets = [name for name in psutil.net_io_counters(pernic=True) if name != 'lo']
         self.gpus = []
@@ -129,6 +186,7 @@ class Monitor:
         freq = psutil.cpu_freq()
         mem = psutil.virtual_memory()
         swap = psutil.swap_memory()
+        meminfo = memory_counters()
         processes = threads = 0
         rows, previous = [], {}
         for pid in psutil.pids():
@@ -160,7 +218,9 @@ class Monitor:
                   'memory': {'value': (mem.total-mem.available)/mem.total*100, 'total': mem.total,
                              'used': mem.total-mem.available, 'available': mem.available,
                              'cached': getattr(mem, 'cached', 0), 'buffers': getattr(mem, 'buffers', 0),
-                             'shared': getattr(mem, 'shared', 0), 'swap': swap.used, 'swap_total': swap.total},
+                             'shared': getattr(mem, 'shared', 0), 'swap': swap.used, 'swap_total': swap.total,
+                             'committed':meminfo.get('Committed_AS'), 'commit_limit':meminfo.get('CommitLimit'),
+                             'slab_reclaimable':meminfo.get('SReclaimable'), 'slab_unreclaimable':meminfo.get('SUnreclaim')},
                   'disks': {}, 'nets': {}, 'gpus': {}, 'process_rows': rows}
         disks = psutil.disk_io_counters(perdisk=True)
         for name in self.disks:

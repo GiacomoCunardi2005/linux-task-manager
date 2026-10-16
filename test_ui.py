@@ -42,6 +42,9 @@ class UITests(unittest.TestCase):
                 self.assertTrue(button.isChecked())
                 self.assertTrue(window.heading.text())
                 self.assertTrue(window.info_text)
+                if pair[0] == 'memory':
+                    for field in ('Velocità:', 'Slot utilizzati:', 'Fattore di forma:', 'Slab recuperabile', 'Impegnata / limite'):
+                        self.assertIn(field,window.info_text)
                 visible = [w for w in window.stats.findChildren(QWidget, options=Qt.FindDirectChildrenOnly) if w.isVisible()]
                 self.assertEqual(len(visible),2)
             window.select('cpu','cpu')
@@ -68,6 +71,10 @@ class UITests(unittest.TestCase):
                     self.app.processEvents()
                     self.assertTrue(window.grab().save(f'reference/linux-{kind}.png'))
             window.resize(900,660)
+            window.select('memory','memory')
+            self.app.processEvents()
+            window.grab().save('reference/linux-memory-compact.png')
+            self.assertEqual(window.findChild(QScrollArea,'detail-scroll').horizontalScrollBar().maximum(),0)
             window.select('cpu','cpu')
             self.app.processEvents()
             window.grab().save('reference/linux-compact.png')
