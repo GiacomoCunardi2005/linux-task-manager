@@ -46,6 +46,16 @@ class UITests(unittest.TestCase):
             data['nets'] = {'wlan-test':device}
             window.receive(data)
             window.select('nets','wlan-test')
+            window.histories.clear()
+            device.update(value=12500,sent=1000,received=12500)
+            window.receive(data)
+            self.assertEqual(window.graphs[0].maximum,1_000_000)
+            self.assertEqual(window.resources[('nets','wlan-test')].graph.maximum,1_000_000)
+            self.assertEqual(window.scale.text(),'1.0 Mbps')
+            device.update(value=8000000,sent=2000000,received=8000000)
+            window.receive(data)
+            self.assertGreater(window.graphs[0].maximum,1_000_000)
+            self.assertEqual(window.graphs[0].maximum,window.resources[('nets','wlan-test')].graph.maximum)
             names = ('Rete (SSID):','Standard Wi-Fi:','Banda:','Frequenza:','Canale:',
                 'Larghezza canale:','Segnale:','Bitrate RX (radio):','Bitrate TX (radio):',
                 'Nome scheda:','Tipo di connessione:','Driver:','MTU:','Collegamento USB:',

@@ -641,7 +641,7 @@ class Window(QWidget):
             button.setToolTip(f'{button.title.text()}\n{sub}')
             history = list(self.histories[(kind,key)])
             button.graph.samples = [(history[-1][0]-60,d['value']), history[-1]] if kind == 'memory' and history else history
-            button.graph.maximum = max(1000,max((v for _,v in history if v is not None),default=0)*1.1) if kind == 'nets' else 100
+            button.graph.maximum = max(1_000_000,max((v for _,v in history if v is not None),default=0)*1.1) if kind == 'nets' else 100
             button.graph.update()
         kind,key = self.selection
         if kind == 'connections':
@@ -745,7 +745,7 @@ class Window(QWidget):
             if d['value'] is None:
                 self.notice.setText('Il driver non espone un contatore di utilizzo accessibile. Nessun valore simulato.')
         history = list(self.histories[(kind,key)])
-        maximum = max(1000,max((v for _,v in history if v is not None),default=0)*1.1) if kind == 'nets' else 100
+        maximum = max(1_000_000,max((v for _,v in history if v is not None),default=0)*1.1) if kind == 'nets' else 100
         if kind == 'nets':
             self.scale.setText(bitrate(maximum))
         for i,graph in enumerate(self.graphs):
