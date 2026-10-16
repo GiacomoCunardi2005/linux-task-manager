@@ -103,7 +103,7 @@ class ServerTests(unittest.TestCase):
                 endpoint(host,port,key)
         self.assertEqual(endpoint('[::1]',8765,self.key)[0],'::1')
         packet = json.loads(self.snapshots.current())
-        for path,value in [(('version',),99),(('data','process_rows'),{}),(('data','cpu','cores'),[float('nan')]),(('memory_hardware','installed'),'32 GB'),(('data','memory','total'),-1),(('data','memory','value'),101),(('data','cpu','value'),10**500)]:
+        for path,value in [(('version',),99),(('data','process_rows'),{}),(('data','cpu','cores'),[float('nan')]),(('memory_hardware','installed'),'32 GB'),(('data','memory','total'),-1),(('data','memory','value'),101),(('data','cpu','value'),10**500),(('data','connections'),[dict(id='cycle',parent='cycle',name='Test',kind='Hub',protocol='USB4',speed=None,details=[])])]:
             invalid = copy.deepcopy(packet)
             parent = invalid
             for field in path[:-1]:
@@ -111,6 +111,9 @@ class ServerTests(unittest.TestCase):
             parent[path[-1]] = value
             with self.assertRaises(ValueError):
                 validate_packet(invalid)
+        legacy = copy.deepcopy(packet)
+        legacy['data'].pop('connections',None)
+        validate_packet(legacy)
         self.assertLess(self.snapshots.updated,time.monotonic()+1)
         with patch('server.time.monotonic',return_value=self.snapshots.updated+11):
             self.assertIsNone(self.snapshots.current())

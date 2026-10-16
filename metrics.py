@@ -8,7 +8,7 @@ from collections import Counter
 import time
 import psutil
 from process_network import ProcessNetwork
-from hardware import read, number, disk_devices, gpu_devices, npu_devices, wifi_link, link_details, network_identity
+from hardware import read, number, disk_devices, gpu_devices, npu_devices, wifi_link, link_details, network_identity, connection_devices
 
 
 def rate(current, previous, elapsed):
@@ -203,7 +203,7 @@ class Monitor:
                              'shared': getattr(mem, 'shared', 0), 'swap': swap.used, 'swap_total': swap.total,
                              'committed':meminfo.get('Committed_AS'), 'commit_limit':meminfo.get('CommitLimit'),
                              'slab_reclaimable':meminfo.get('SReclaimable'), 'slab_unreclaimable':meminfo.get('SUnreclaim')},
-                  'disks': {}, 'nets': {}, 'gpus': {}, 'npus': {}, 'process_rows': rows}
+                  'disks': {}, 'nets': {}, 'gpus': {}, 'npus': {}, 'process_rows': rows, 'connections':connection_devices()}
         disks = psutil.disk_io_counters(perdisk=True,nowrap=False)
         metadata = disk_devices()
         for name,device in metadata.items():

@@ -25,3 +25,7 @@ A title-bar connection button opens a compact IP/host, port and access-key form.
 ## Network Performance details
 
 Preserve every network metric. Keep the chart first, then a compact full-width row of live send/receive values. Under that row, separate connection/radio details, adapter details and addresses with short headings and 20px group gaps, without cards or collapsed disclosures. At 560px available detail width, show connection on the left and adapter/addresses on the right; below that, stack the groups with vertical scrolling. Give IPv6 its own full-width value row so complete addresses remain readable. All values remain in Copy information, and metadata values can be selected or inspected via tooltip. The shared statistics layout must respect content minimum heights rather than squeeze rows; CPU/RAM retain their existing paired-statistics layout.
+
+## Physical connections
+
+Add Collegamenti inside the existing Performance resource list, with a USB symbol instead of an invented sparkline. Its plain tree reads host/root hub → intermediate hub → peripheral; a separate USB4/Thunderbolt router tree avoids guessed cross-bus associations. Keep standard and negotiated link rate in separate columns, complete names/details in selection and tooltips, and a copy action. No utilization graph exists because no comparable real counter is exposed. Preserve expansion/selection during hotplug updates; reset when changing monitored computer.

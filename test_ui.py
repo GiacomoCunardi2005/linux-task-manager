@@ -120,8 +120,12 @@ class UITests(unittest.TestCase):
                 if pair[0] == 'memory':
                     for field in ('Velocità:', 'Slot utilizzati:', 'Fattore di forma:', 'Slab recuperabile', 'Impegnata / limite'):
                         self.assertIn(field,window.info_text)
-                visible = [w for w in window.stats.findChildren(QWidget, options=Qt.FindDirectChildrenOnly) if w.isVisible()]
-                self.assertEqual(len(visible),2)
+                if pair[0] == 'connections':
+                    self.assertEqual(window.performance_detail.currentWidget(),window.connection_page)
+                    self.assertFalse(window.graphs)
+                else:
+                    visible = [w for w in window.stats.findChildren(QWidget, options=Qt.FindDirectChildrenOnly) if w.isVisible()]
+                    self.assertEqual(len(visible),2)
             window.select('cpu','cpu')
             window.core_action.setChecked(True)
             self.assertEqual(len(window.graphs),len(window.snapshot['cpu']['cores']))

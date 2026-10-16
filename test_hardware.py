@@ -5,7 +5,7 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
-from hardware import disk_devices, npu_devices, parse_wifi_link, wifi_link
+from hardware import disk_devices, npu_devices, parse_wifi_link, wifi_link, connection_devices, link_details
 from metrics import Monitor
 from app import Window
 import test_ui
@@ -34,6 +34,52 @@ class HardwareTests(unittest.TestCase):
             self.assertEqual(devices['sda']['identity'],'42')
             (block/'dev').unlink()
             self.assertEqual(disk_devices(root/'block'),{})
+
+    def test_usb_hub_chain_and_thunderbolt_are_distinct_with_lane_rates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            usb_bus, tb_bus = root/'usb-bus',root/'tb-bus'
+            usb_bus.mkdir(); tb_bus.mkdir()
+            controller = root/'pci'/'0000:00:14.0'/'usb4'
+            hub = controller/'4-1'
+            nic = hub/'4-1.2'
+            for node,properties in ((controller,dict(product='xHCI',speed='20000',version='3.10',bDeviceClass='09')),
+                (hub,dict(product='Dock hub',speed='10000',version='3.10',bDeviceClass='09')),
+                (nic,dict(product='Dock Ethernet',speed='5000',version='3.00',bDeviceClass='00'))):
+                node.mkdir(parents=True,exist_ok=True)
+                for name,value in dict(properties,idVendor='1234',idProduct='5678').items():
+                    (node/name).write_text(value)
+                (usb_bus/node.name).symlink_to(node,target_is_directory=True)
+            host = root/'other-pci'/'domain0'/'0-0'
+            dock = host/'0-1'
+            for node,properties in ((host,dict(generation='4',device_name='Host USB4')),
+                (dock,dict(generation='3',device_name='Thunderbolt dock',rx_speed='20.0 Gb/s',rx_lanes='2',tx_speed='20.0 Gb/s',tx_lanes='2',authorized='0'))):
+                node.mkdir(parents=True,exist_ok=True)
+                for name,value in properties.items():
+                    (node/name).write_text(value)
+                (tb_bus/node.name).symlink_to(node,target_is_directory=True)
+            nodes = connection_devices(usb_bus,tb_bus)
+            by_name = {node['name']:node for node in nodes}
+            self.assertEqual(by_name['Dock Ethernet']['parent'],str(hub))
+            self.assertEqual(by_name['Dock hub']['parent'],str(controller))
+            self.assertEqual(by_name['xHCI']['protocol'],'USB 3.10')
+            self.assertNotIn('USB4',by_name['xHCI']['protocol'])
+            self.assertEqual(by_name['Host USB4']['protocol'],'USB4')
+            self.assertEqual(by_name['Thunderbolt dock']['protocol'],'Thunderbolt 3')
+            self.assertEqual(by_name['Thunderbolt dock']['speed'],'40 Gbit/s')
+            self.assertEqual(by_name['Thunderbolt dock']['parent'],str(host))
+            self.assertIn(('Autorizzazione','Da autorizzare'),by_name['Thunderbolt dock']['details'])
+            self.assertIsNone(by_name['xHCI']['speed'])
+            link = link_details(nic/'4-1.2:1.0')
+            self.assertEqual(link['link_speed'],'5 Gbit/s')
+            self.assertIn('Dock hub (10 Gbit/s)',link['usb_route'])
+            self.assertIn('Dock Ethernet (5 Gbit/s)',link['usb_route'])
+            self.assertEqual(link['usb_controller'],'0000:00:14.0')
+            (dock/'rx_lanes').unlink()
+            self.assertIn('N/D',next(n for n in connection_devices(usb_bus,tb_bus) if n['name']=='Thunderbolt dock')['speed'])
+            (usb_bus/nic.name).unlink()
+            self.assertNotIn('Dock Ethernet',[n['name'] for n in connection_devices(usb_bus,tb_bus)])
+            self.assertEqual(connection_devices(root/'missing',root/'missing2'),[])
 
     def test_disk_replacement_with_same_name_has_no_false_io_spike(self):
         monitor = Monitor()
@@ -111,6 +157,48 @@ class HotplugUITests(unittest.TestCase):
     def setUpClass(cls):
         test_ui.UITests.setUpClass()
         cls.app = test_ui.UITests.app
+
+    def test_connections_view_keeps_selection_expansion_and_clears_on_source_change(self):
+        window = Window()
+        window.show_page('performance')
+        window.show()
+        try:
+            test_ui.wait(1200)
+            window.timer.stop(); window.sampler.wait(); self.app.processEvents()
+            data = copy.deepcopy(window.snapshot)
+            host = dict(id='host',parent=None,name='Controller di prova',kind='Controller host',protocol='USB4',speed=None,details=[('Tipo','Controller host')])
+            hub = dict(id='hub',parent='host',name='Dock di prova',kind='Router / dock',protocol='USB4',speed='40 Gbit/s',details=[('Totale RX','40 Gbit/s')])
+            device = dict(id='device',parent='hub',name='Ethernet di prova',kind='Dispositivo USB',protocol='USB 3.00',speed='5 Gbit/s',details=[('Velocità negoziata','5 Gbit/s')])
+            data['connections'] = [host,hub,device]
+            window.receive(data); window.select('connections','connections')
+            page = window.connection_page
+            self.assertFalse(window.graphs)
+            self.assertEqual(window.performance_detail.currentWidget(),page)
+            self.assertEqual(page.items['device'].parent(),page.items['hub'])
+            page.tree.setCurrentItem(page.items['device'])
+            page.items['hub'].setExpanded(False)
+            self.assertIn('Controller di prova → Dock di prova → Ethernet di prova',page.detail.text())
+            device['speed'] = '480 Mbit/s'
+            window.receive(data)
+            self.assertEqual(page.tree.currentItem().data(0,test_ui.Qt.UserRole),'device')
+            self.assertFalse(page.items['hub'].isExpanded())
+            self.assertEqual(page.items['device'].text(2),'480 Mbit/s')
+            self.assertIn('40 Gbit/s',page.copy_text)
+            page.items['hub'].setExpanded(True)
+            self.app.processEvents()
+            Path('reference').mkdir(exist_ok=True)
+            window.grab().save('reference/linux-connections-fixture.png')
+            window.toggle_pause()
+            data['connections'] = [host]
+            window.receive(data)
+            self.assertIn('device',page.items)
+            window.toggle_pause()
+            self.assertNotIn('device',page.items)
+            self.assertIsNone(page.tree.currentItem())
+            window.switch_monitor(Monitor())
+            self.assertFalse(page.items)
+        finally:
+            window.close()
 
     def test_sidebar_add_remove_replace_while_paused(self):
         window = Window()

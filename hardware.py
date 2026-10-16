@@ -18,19 +18,30 @@ def number(path):
         return None
 
 
+def usb_speed(node):
+    try:
+        rate = float(read(Path(node)/'speed'))
+        if 0 < rate < 1000000:
+            return f'{rate/1000:g} Gbit/s' if rate >= 1000 else f'{rate:g} Mbit/s'
+    except ValueError:
+        pass
+    return None
+
+
 def link_details(path):
     device = Path(path).resolve()
     parents = (device,*device.parents)
-    for node in parents:
-        if (node/'idVendor').exists():
-            try:
-                rate = float(read(node/'speed'))
-                speed = f'{rate/1000:g} Gbit/s' if rate >= 1000 else f'{rate:g} Mbit/s' if rate > 0 else None
-            except ValueError:
-                speed = None
-            return {'bus':'USB','link_speed':speed,
-                    'usb_version':read(node/'version') or None,
-                    'usb_product':read(node/'product') or None}
+    usb = [node for node in parents if (node/'idVendor').exists()]
+    if usb:
+        node, root = usb[0],usb[-1]
+        route = []
+        for ancestor in reversed(usb):
+            name = read(ancestor/'product') or ancestor.name
+            speed = usb_speed(ancestor) if not re.fullmatch(r'usb\d+',ancestor.name) else None
+            route.append(name+(f' ({speed})' if speed else ''))
+        return {'bus':'USB','link_speed':usb_speed(node),
+            'usb_version':read(node/'version') or None,'usb_product':read(node/'product') or None,
+            'usb_route':' → '.join(route), 'usb_controller':root.parent.name}
     for node in parents:
         if re.fullmatch(r'ata\d+',node.name):
             speed = next((read(p) for p in node.glob('link*/sata_spd') if read(p)),None)
@@ -146,3 +157,45 @@ def wifi_link(interface):
         return parse_wifi_link(result.stdout if result.returncode == 0 else '')
     except (OSError,subprocess.TimeoutExpired):
         return parse_wifi_link('')
+
+
+def connection_devices(usb_root=Path('/sys/bus/usb/devices'),tb_root=Path('/sys/bus/thunderbolt/devices')):
+    """Keep USB and Thunderbolt trees separate unless sysfs proves a relationship."""
+    result = []
+    usb = {p.resolve():p for p in usb_root.glob('*') if re.fullmatch(r'[0-9a-fA-F]{4}',read(p/'idVendor'))}
+    for path,p in sorted(usb.items(),key=lambda item:(len(item[0].parts),str(item[0]))):
+        root = re.fullmatch(r'usb\d+',p.name) is not None
+        parent = next((str(a) for a in path.parents if a in usb),None)
+        version = read(p/'version')
+        speed = usb_speed(p)
+        vendor,product = read(p/'idVendor'),read(p/'idProduct')
+        kind = 'Root hub / controller' if root else 'Hub USB' if read(p/'bDeviceClass').lower() == '09' else 'Dispositivo USB'
+        details = [('Tipo',kind),('Produttore',read(p/'manufacturer') or 'Non disponibile'),
+            ('ID USB',vendor+':'+product),('Porta / bus',p.name),('Versione USB dichiarata',version or 'Non disponibile'),
+            ('Velocità negoziata',speed if not root and speed else 'Non disponibile' if not root else 'Non applicabile al root hub'),
+            ('Controller',next((a.parent.name for a in (path,*path.parents) if re.fullmatch(r'usb\d+',a.name)), 'Non disponibile'))]
+        result.append(dict(id=str(path),parent=parent,name=read(p/'product') or p.name,kind=kind,
+            protocol='USB '+version if version else 'USB',speed=None if root else speed,details=details))
+    routers = {p.resolve():p for p in tb_root.glob('*') if re.fullmatch(r'\d+-[0-9a-fA-F]+',p.name) and (p/'generation').exists()}
+    for path,p in sorted(routers.items(),key=lambda item:(len(item[0].parts),str(item[0]))):
+        generation = read(p/'generation')
+        protocol = 'USB4' if generation == '4' else 'Thunderbolt '+generation if generation in ('1','2','3') else 'USB4 / Thunderbolt'
+        parent = next((str(a) for a in path.parents if a in routers),None)
+        host = p.name.endswith('-0')
+        totals = {}
+        details = [('Tipo','Controller host' if host else 'Router / dock'),('Protocollo rilevato',protocol),
+            ('Produttore',read(p/'vendor_name') or 'Non disponibile'),('Porta / dominio',p.name),
+            ('Autorizzazione',{'0':'Da autorizzare','1':'Autorizzato'}.get(read(p/'authorized'),'Non disponibile'))]
+        for direction in ('rx','tx'):
+            speed,lanes = read(p/(direction+'_speed')),number(p/(direction+'_lanes'))
+            match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)\s+Gb/s',speed)
+            total = float(match[1])*lanes if match and lanes and 0 < lanes <= 4 else None
+            totals[direction] = f'{total:g} Gbit/s' if total and total < 1000000 else None
+            details.extend([(direction.upper()+' per corsia',speed or 'Non disponibile'),
+                ('Corsie '+direction.upper(),str(lanes) if lanes else 'Non disponibile'),
+                ('Totale '+direction.upper(),totals[direction] or 'Non disponibile')])
+        speed = totals['rx'] if totals['rx'] == totals['tx'] else 'RX '+(totals['rx'] or 'N/D')+' / TX '+(totals['tx'] or 'N/D')
+        result.append(dict(id=str(path),parent=parent,name=read(p/'device_name') or p.name,
+            kind='Controller host' if host else 'Router / dock',protocol=protocol,speed=speed,details=details))
+    result.sort(key=lambda node:not node['protocol'].startswith(('USB4','Thunderbolt')))
+    return result

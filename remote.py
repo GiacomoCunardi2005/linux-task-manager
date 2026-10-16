@@ -78,6 +78,8 @@ def validate_packet(packet):
                 fields(device, 'model type', lambda v:isinstance(v,str))
                 fields(device, 'bus link_speed usb_version usb_product', text)
                 fields(device, 'removable', lambda v:type(v) is bool)
+                if 'usb_route' in device:
+                    fields(device,'usb_route usb_controller',lambda v:isinstance(v,str))
                 fields(device, 'mounts', lambda v:isinstance(v,list) and all(isinstance(s,str) for s in v))
             elif kind == 'nets':
                 fields(device, 'sent received', lambda v:number(v) and v is not None)
@@ -86,6 +88,8 @@ def validate_packet(packet):
                 fields(device, 'duplex mac driver ssid standard band frequency channel width signal rx_rate tx_rate bssid', text)
                 fields(device, 'connected wifi', lambda v:type(v) is bool)
                 fields(device.get('link'), 'bus link_speed', text)
+                if 'usb_route' in device['link']:
+                    fields(device['link'],'usb_route usb_controller',lambda v:isinstance(v,str))
             else:
                 fields(device, 'name driver pci', lambda v:isinstance(v,str))
                 fields(device, 'freq', number)
@@ -96,6 +100,17 @@ def validate_packet(packet):
                     fields(device, 'vram vram_total', number)
                     fields(device, 'partial', lambda v:type(v) is bool)
                     fields(device, 'engines', lambda v:isinstance(v,dict) and all(isinstance(k,str) and percentage(n) for k,n in v.items()))
+    if 'connections' in data:
+        if not isinstance(data['connections'],list) or len(data['connections'])>4096:
+            raise ValueError('Elenco collegamenti non valido.')
+        seen = set()
+        for node in data['connections']:
+            fields(node,'id name kind protocol',lambda v:isinstance(v,str))
+            fields(node,'parent speed',text)
+            fields(node,'details',lambda v:isinstance(v,list) and all(isinstance(pair,list) and len(pair)==2 and all(isinstance(s,str) for s in pair) for pair in v))
+            if node['id'] in seen or node['parent'] is not None and node['parent'] not in seen:
+                raise ValueError('Gerarchia dei collegamenti non valida.')
+            seen.add(node['id'])
     fields(data, 'process_network_status', lambda v:isinstance(v,str))
     return data
 

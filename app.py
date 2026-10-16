@@ -15,10 +15,12 @@ from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, 
 from metrics import Monitor, read, size, percent, uptime
 from processes import ProcessPage
 from remote import RemoteMonitor, PORT
+from connections import ConnectionsPage
 
-COLORS = {'cpu':'#42a7bf', 'memory':'#8b8fd7', 'disks':'#9bc86b', 'nets':'#d48bbb', 'gpus':'#aa92d0', 'npus':'#d4a5db'}
+COLORS = {'cpu':'#42a7bf', 'memory':'#8b8fd7', 'disks':'#9bc86b', 'nets':'#d48bbb', 'gpus':'#aa92d0', 'npus':'#d4a5db', 'connections':'#7daeb8'}
 ICON_PATHS = {
  'menu':'M4 6h16M4 12h16M4 18h16',
+ 'connections':'M12 21V3 M9 6l3-3 3 3 M12 16l-6-4V8 M12 12l6-4V5 M4 8h4 M16 3h4v3h-4z',
  'performance':'M3 3h18v18H3z M5 13h4l2-6 3 11 2-5h3',
  'processes':'M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z',
  'history':'M4 6a9 9 0 1 1-1 9 M3 2v6h6 M12 6v6l4 2',
@@ -105,7 +107,7 @@ class Graph(QWidget):
 
 
 class Resource(QPushButton):
-    def __init__(self, title, color):
+    def __init__(self, title, color, chart=True):
         super().__init__()
         self.setCheckable(True)
         self.setFixedHeight(70)
@@ -113,9 +115,13 @@ class Resource(QPushButton):
         row = QHBoxLayout(self)
         row.setContentsMargins(10,6,8,6)
         row.setSpacing(10)
-        self.graph = Graph(color, True)
-        self.graph.setFixedSize(60,42)
-        row.addWidget(self.graph)
+        self.graph = Graph(color, True) if chart else None
+        marker = self.graph or label()
+        if not chart:
+            marker.setPixmap(icon('connections',color).pixmap(30,30))
+            marker.setAlignment(Qt.AlignCenter)
+        marker.setFixedSize(60,42)
+        row.addWidget(marker)
         column = QVBoxLayout()
         column.setSpacing(1)
         self.full_title = title
@@ -126,7 +132,7 @@ class Resource(QPushButton):
         column.addWidget(self.subtitle)
         row.addLayout(column,1)
         # Child labels must not swallow the button's pointer events.
-        for child in (self.graph, self.title, self.subtitle):
+        for child in (marker, self.title, self.subtitle):
             child.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAccessibleName(title)
 
@@ -355,7 +361,11 @@ class Window(QWidget):
         self.notice.setWordWrap(True)
         self.detail_layout.addWidget(self.notice)
         detail_scroll.setWidget(detail)
-        content.addWidget(detail_scroll,1)
+        self.performance_detail = QStackedWidget()
+        self.performance_detail.addWidget(detail_scroll)
+        self.connection_page = ConnectionsPage()
+        self.performance_detail.addWidget(self.connection_page)
+        content.addWidget(self.performance_detail,1)
         self.pages = QStackedWidget()
         self.process_page = ProcessPage(icon('processes'))
         self.pages.addWidget(self.process_page)
@@ -446,9 +456,11 @@ class Window(QWidget):
         self.process_page.reset(isinstance(monitor,RemoteMonitor))
         self.sync_resources({'disks':{},'nets':{},'gpus':{},'npus':{}})
         for resource in self.resources.values():
-            resource.graph.samples, resource.graph.secondary = [],[]
+            if resource.graph:
+                resource.graph.samples, resource.graph.secondary = [],[]
+                resource.graph.update()
             resource.subtitle.setText('In attesa')
-            resource.graph.update()
+        self.connection_page.receive([])
         self.select('cpu','cpu')
         self.device.setText(monitor.cpu_name)
         self.set_stats([],[])
@@ -484,6 +496,7 @@ class Window(QWidget):
         entries += [('nets',name,'Wi-Fi' if device['wifi'] else 'Ethernet') for name,device in data['nets'].items()]
         entries += [('gpus',name,f'GPU {i}') for i,name in enumerate(data['gpus'])]
         entries += [('npus',name,f'NPU {i}') for i,name in enumerate(data['npus'])]
+        entries += [('connections','connections','Collegamenti')]
         wanted = {(kind,key) for kind,key,_ in entries}
         reset = set(self.resources)-wanted
         for kind,key,_ in entries:
@@ -503,7 +516,7 @@ class Window(QWidget):
                     self.histories.pop(history_key)
         for index,(kind,key,title) in enumerate(entries):
             if (kind,key) not in self.resources:
-                button = Resource(title,COLORS[kind])
+                button = Resource(title,COLORS[kind],chart=kind != 'connections')
                 button.clicked.connect(lambda checked=False,k=kind,n=key: self.select(k,n))
                 self.resources[(kind,key)] = button
             button = self.resources[(kind,key)]
@@ -558,6 +571,7 @@ class Window(QWidget):
         for pair,button in self.resources.items():
             button.setChecked(pair == self.selection)
         self.core_action.setEnabled(kind == 'cpu')
+        self.performance_detail.setCurrentIndex(1 if kind == 'connections' else 0)
         self.rebuild_graphs()
         if self.snapshot:
             self.render()
@@ -575,7 +589,10 @@ class Window(QWidget):
             graph.deleteLater()
         for row in range(self.charts.rowCount()):
             self.charts.setRowStretch(row,0)
+        self.graphs = []
         kind,_ = self.selection
+        if kind == 'connections':
+            return
         count = (len(self.snapshot['cpu']['cores']) if self.snapshot else (self.monitor.cpu_details[3][1] if len(self.monitor.cpu_details)>3 else 1)) if kind == 'cpu' and self.logical else 1
         count = int(count) if str(count).isdigit() else 1
         if kind == 'gpus':
@@ -583,7 +600,6 @@ class Window(QWidget):
         elif kind == 'disks':
             count = 2
         cols = 1 if kind == 'disks' else (4 if count > 8 else (2 if count > 1 else 1))
-        self.graphs = []
         for i in range(count):
             graph = Graph(COLORS[kind])
             graph.setMinimumSize(50,160 if count == 1 else 45)
@@ -603,6 +619,10 @@ class Window(QWidget):
     def render(self):
         data = self.snapshot
         for (kind,key),button in self.resources.items():
+            if kind == 'connections':
+                nodes = data.get('connections')
+                button.subtitle.setText('USB / Thunderbolt\n'+(f'{len(nodes)} elementi' if nodes is not None else 'Aggiorna il server'))
+                continue
             d = data[kind] if kind in ('cpu','memory') else data[kind].get(key)
             if d is None:
                 button.subtitle.setText('Dispositivo non disponibile')
@@ -624,6 +644,10 @@ class Window(QWidget):
             button.graph.maximum = max(1000,max((v for _,v in history if v is not None),default=0)*1.1) if kind == 'nets' else 100
             button.graph.update()
         kind,key = self.selection
+        if kind == 'connections':
+            self.connection_page.receive(data.get('connections'))
+            self.info_text = 'USB e Thunderbolt\n'+self.connection_page.copy_text
+            return
         d = data[kind] if kind in ('cpu','memory') else data[kind].get(key)
         if d is None:
             self.notice.setText('Dispositivo non disponibile. In attesa del rilevamento automatico.')
@@ -671,6 +695,8 @@ class Window(QWidget):
                 ('Montaggi:',', '.join(d.get('mounts',[])) or 'Non montato')]
             if d['bus'] == 'USB':
                 details += [('Versione USB dichiarata:',d.get('usb_version') or 'Non disponibile'),('Prodotto USB:',d.get('usb_product') or 'Non disponibile')]
+                if d.get('usb_route'):
+                    details += [('Percorso USB:',d['usb_route']),('Controller USB:',d['usb_controller'])]
             self.notice.setText('La velocità negoziata è quella del collegamento, distinta dal trasferimento effettivo. Primo campione: in attesa dei contatori.' if d['value'] is None else 'La velocità negoziata del collegamento è distinta dalla velocità effettiva di lettura e scrittura.')
         elif kind == 'nets':
             self.heading.setText('Wi-Fi' if d['wifi'] else 'Ethernet')
@@ -694,6 +720,8 @@ class Window(QWidget):
                 adapter += [('Collegamento USB:',d['link']['link_speed'] or 'Non disponibile')]
             detail_columns = [[('Collegamento Wi-Fi' if d['wifi'] else 'Collegamento Ethernet',connection)],
                 [('Scheda di rete',adapter),('Indirizzi',addresses)]]
+            if d['link'].get('usb_route'):
+                detail_columns[0].append(('Percorso USB',[('Collegamento:',d['link']['usb_route']),('Controller:',d['link']['usb_controller'])]))
             details = [item for column in detail_columns for _,items in column for item in items]
             self.notice.setText('Traffico effettivo: linea continua RX, tratteggiata TX. I bitrate radio e la velocità del collegamento non sono la velocità Internet.' if d['connected'] else 'Disconnesso')
         elif kind == 'npus':
