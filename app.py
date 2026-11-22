@@ -217,6 +217,7 @@ class Window(QWidget):
         self.paused = False
         self.logical = False
         self.tray, self.quitting, self.told_tray, self.seen_alerts = None, False, False, set()
+        self.monitor.light = True  # until the window is first shown (--tray never shows it, so no hideEvent)
         self.setWindowTitle('Gestione attività — Processi Linux')
         self.setWindowIcon(icon('performance',COLORS['cpu']))
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
@@ -457,9 +458,12 @@ class Window(QWidget):
 
     def receive(self,data):
         self.snapshot = data
-        self.sync_resources(data)
-        self.process_page.receive(data)
         self.notify(data)
+        if data.get('light'):
+            return  # tray-only sample: alerts only, no device data for tables, charts or histories
+        if self.isVisible():
+            self.sync_resources(data)
+            self.process_page.receive(data)
         now = time.monotonic()
         for kind in ('cpu','memory'):
             self.histories[(kind,kind)].append((now,data[kind]['value']))
@@ -477,8 +481,21 @@ class Window(QWidget):
                 if kind == 'nets':
                     for field in ('sent','received'):
                         self.histories[(field,key)].append((now,values[field]))
-        if not self.paused:
+        if not self.paused and self.isVisible():
             self.render()
+
+    def showEvent(self,event):
+        super().showEvent(event)
+        self.monitor.light = False
+        if self.snapshot and not self.snapshot.get('light'):  # catch up; a light sample is replaced within 1 s
+            self.sync_resources(self.snapshot)
+            self.process_page.receive(self.snapshot)
+            if not self.paused:
+                self.render()
+
+    def hideEvent(self,event):
+        super().hideEvent(event)
+        self.monitor.light = True  # no GPU client scan while nobody looks at the charts
 
     def show_error(self,error):
         self.notice.setText(error+' — nuovo tentativo tra un secondo.')

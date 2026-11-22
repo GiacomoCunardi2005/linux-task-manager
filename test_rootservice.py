@@ -71,6 +71,43 @@ class RootStateTests(unittest.TestCase):
         self.assertTrue(monitor.detector.traps.paths)  # and re-armed when the service is gone
 
 
+class LightSampleTests(unittest.TestCase):
+    def test_tray_sample_keeps_security_and_device_counters(self):
+        monitor = Monitor()
+        self.addCleanup(monitor.close)
+        with patch('metrics.root_state',return_value=None):
+            full = monitor.sample()
+            last = monitor.last_time
+            monitor.light = True
+            light = monitor.sample()
+        self.assertTrue(light['light'])
+        self.assertEqual((light['disks'],light['nets'],light['connections']),({},{},[]))
+        self.assertEqual(set(light['threats']),{'processes','system','traps'})
+        self.assertEqual(light['protection'],'utente')
+        self.assertTrue(light['process_rows'])
+        self.assertEqual(monitor.last_time,last)  # next full sample averages rates over the hidden period
+        self.assertTrue(full['disks'] or full['nets'])
+
+    def test_light_sample_does_not_remove_devices_from_an_open_window(self):
+        from PySide6.QtWidgets import QApplication
+        import test_ui
+        test_ui.UITests.setUpClass()
+        from app import Window
+        window = Window()
+        window.show()
+        try:
+            test_ui.wait(1400)
+            window.timer.stop()
+            window.sampler.wait()
+            before = set(window.resources)
+            window.receive(dict(window.snapshot,light=True,disks={},nets={},gpus={},npus={},connections=[]))
+            QApplication.processEvents()
+            self.assertEqual(set(window.resources),before)
+        finally:
+            window.quitting = True
+            window.close()
+
+
 class RootServiceTests(unittest.TestCase):
     def test_sampler_state_and_atomic_private_write(self):
         sampler = rootservice.Sampler()
@@ -87,6 +124,25 @@ class RootServiceTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777,0o640)
             self.assertIsNotNone(root_state(path,owner=os.getuid()))
             self.assertEqual(sorted(p.name for p in Path(folder).iterdir()),['state.json'])
+
+    def test_raw_proc_sampler_matches_psutil(self):
+        busy = subprocess.Popen([sys.executable,'-c','while True: pass'])
+        self.addCleanup(busy.wait)
+        self.addCleanup(busy.kill)
+        sampler = rootservice.Sampler()
+        sampler.rows()
+        time.sleep(1)
+        rows = {r['pid']:r for r in sampler.rows()}
+        proc = psutil.Process(busy.pid)
+        row = rows[busy.pid]
+        self.assertEqual((row['created'],row['exe'],row['ppid'],row['uid'],row['name']),
+                         (proc.create_time(),proc.exe(),proc.ppid(),proc.uids().real,proc.name()))
+        self.assertGreater(row['cpu'],80/sampler.cores)  # one full core, as a share of the whole machine
+        self.assertIsNotNone(rows[os.getpid()]['disk'])
+        self.assertIn(busy.pid,{pid for pid,_ in sampler.static})  # described once, then cached
+        with patch.object(rootservice.Sampler,'describe',wraps=rootservice.Sampler.describe) as describe:
+            sampler.rows()
+        self.assertNotIn(busy.pid,[call.args[0] for call in describe.call_args_list])  # known processes are not re-read
 
     def test_terminate_checks_caller_identity_and_protected_pids(self):
         child = subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])

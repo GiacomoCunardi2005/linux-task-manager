@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))  # python -I does not add the script folder
 import psutil
-from detection import Detector, Traps, ExecWatcher, crontab, default_places
+from detection import Detector, Traps, ExecWatcher, ProcessScanner, crontab, default_places
 
 CONFIG = Path('/etc/linux-task-manager/service.json')
 # Root-owned ignore list: a user-writable one would let user-level malware switch the checks off.
@@ -29,30 +29,7 @@ def load_user(config=CONFIG):
     return pwd.getpwnam(json.loads(config.read_text())['user'])
 
 
-class Sampler:
-    def __init__(self):
-        self.last, self.time, self.cores = {}, time.monotonic(), psutil.cpu_count() or 1
-
-    def rows(self):
-        now = time.monotonic()
-        dt, self.time = max(1e-3,now-self.time), now
-        rows, current = [], {}
-        for proc in psutil.process_iter(['pid','name','exe','cmdline','ppid','create_time','cpu_times','io_counters','uids']):
-            info = proc.info
-            if info['create_time'] is None:
-                continue
-            cpu, io = info['cpu_times'], info['io_counters']
-            cpu_time = cpu.user+cpu.system if cpu else None
-            io_bytes = io.read_bytes+io.write_bytes if io else None
-            key = (info['pid'],info['create_time'])
-            old_cpu,old_io = self.last.get(key,(None,None))
-            current[key] = (cpu_time,io_bytes)
-            rows.append(dict(pid=info['pid'],created=info['create_time'],name=info['name'] or str(info['pid']),exe=info['exe'],
-                cmdline=info['cmdline'] or [],ppid=info['ppid'],uid=info['uids'].real if info['uids'] else None,
-                cpu=min(100,(cpu_time-old_cpu)/dt*100/self.cores) if cpu_time is not None and old_cpu is not None else None,
-                disk=max(0,(io_bytes-old_io)/dt) if io_bytes is not None and old_io is not None else None))
-        self.last = current
-        return rows
+Sampler = ProcessScanner  # shared with the app
 
 
 def state(rows,threats,uid,features):

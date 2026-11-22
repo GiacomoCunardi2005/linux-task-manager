@@ -10,7 +10,7 @@ from collections import Counter
 import time
 import psutil
 from process_network import ProcessNetwork
-from detection import Detector, ExecWatcher, validate_threats
+from detection import Detector, ExecWatcher, ProcessScanner, validate_threats
 from hardware import read, number, disk_devices, gpu_devices, npu_devices, wifi_link, link_details, network_identity, connection_devices, network_hardware
 
 
@@ -140,7 +140,8 @@ class Monitor:
         self.last_gpu = {}
         self.last_disk_ids = {}
         self.last_npu = {}
-        self.last_processes = {}
+        self.scanner = ProcessScanner()
+        self.light = False  # set while the window is hidden in the tray: skip work only the charts need
         self.last_cpu = psutil.cpu_times(percpu=True)
         self.process_network = ProcessNetwork()
         self.detector = Detector()
@@ -197,6 +198,21 @@ class Monitor:
                 clients[(pci, cid)] = engines
         return clients
 
+    def security(self,rows,cores,result):
+        state = root_state()
+        if state:
+            # The root service sees every process and owns the traps while it runs; local traps are removed.
+            self.detector.close()
+            for row in rows:
+                extra = state['processes'].get(f"{row['pid']}:{row['created']!r}")
+                if extra:
+                    row['exe'] = row['exe'] or extra['exe']
+                    row['disk'] = row['disk'] if row['disk'] is not None else extra['disk']
+            result['threats'], result['protection'] = state['threats'], 'root'
+        else:
+            result['threats'], result['protection'] = self.detector.assess(rows,cores), 'utente'
+        result['root_available'] = ROOT_TERMINATE.exists()
+
     def sample(self):
         now = time.monotonic()
         dt = now - self.last_time
@@ -207,31 +223,8 @@ class Monitor:
         mem = psutil.virtual_memory()
         swap = psutil.swap_memory()
         meminfo = memory_counters()
-        processes = threads = 0
-        rows, previous = [], {}
-        for pid in psutil.pids():
-            try:
-                proc = psutil.Process(pid)
-                info = proc.as_dict(['pid','name','create_time','cpu_times','memory_info',
-                                     'status','username','uids','num_threads','io_counters','exe','cmdline','ppid'])
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-            processes += 1
-            threads += info['num_threads'] or 0
-            identity = (pid,info['create_time'])
-            cpu = info['cpu_times']
-            cpu_time = cpu.user+cpu.system if cpu else None
-            io = info['io_counters']
-            io_bytes = io.read_bytes+io.write_bytes if io else None
-            old_cpu,old_io = self.last_processes.get(identity,(None,None))
-            previous[identity] = (cpu_time,io_bytes)
-            rows.append({'pid':pid, 'created':info['create_time'], 'name':info['name'] or str(pid),
-                'status':info['status'], 'ppid':info['ppid'], 'exe':info['exe'], 'cmdline':info['cmdline'] or [], 'user':info['username'] or 'Non disponibile',
-                'uid':info['uids'].real if info['uids'] else None,
-                'cpu': min(100,rate(cpu_time,old_cpu,dt)*100/max(1,len(times))) if cpu_time is not None and old_cpu is not None else None,
-                'memory':info['memory_info'].rss if info['memory_info'] else None,
-                'disk':rate(io_bytes,old_io,dt) if io_bytes is not None and old_io is not None else None})
-        self.last_processes = previous
+        rows = self.scanner.rows()
+        processes, threads = self.scanner.processes, self.scanner.threads
         result = {'cpu': {'value': sum(cores)/len(cores) if cores else 0, 'cores': cores,
                           'freq': freq.current/1000 if freq else None, 'processes': processes,
                           'threads': threads, 'files': read('/proc/sys/fs/file-nr').split()[0] if read('/proc/sys/fs/file-nr') else 'N/D', 'uptime': time.time()-psutil.boot_time()},
@@ -241,7 +234,14 @@ class Monitor:
                              'shared': getattr(mem, 'shared', 0), 'swap': swap.used, 'swap_total': swap.total,
                              'committed':meminfo.get('Committed_AS'), 'commit_limit':meminfo.get('CommitLimit'),
                              'slab_reclaimable':meminfo.get('SReclaimable'), 'slab_unreclaimable':meminfo.get('SUnreclaim')},
-                  'disks': {}, 'nets': {}, 'gpus': {}, 'npus': {}, 'process_rows': rows, 'connections':connection_devices()}
+                  'disks': {}, 'nets': {}, 'gpus': {}, 'npus': {}, 'process_rows': rows,
+                  'connections':[] if self.light else connection_devices()}
+        if self.light:
+            # Hidden in the tray only security needs data. Device counters and last_time stay untouched,
+            # so the next full sample reports correct average rates over the hidden period.
+            self.security(rows,len(times),result)
+            result['light'] = True
+            return result
         disks = psutil.disk_io_counters(perdisk=True,nowrap=False)
         metadata = disk_devices()
         for name,device in metadata.items():
@@ -294,23 +294,11 @@ class Monitor:
             if result['nets'][name]['wifi']:
                 result['nets'][name].update(wifi_link(name))
         result['process_network_status'] = self.process_network.sample(rows,[(name,d['identity']) for name,d in result['nets'].items() if d['connected']])
-        state = root_state()
-        if state:
-            # The root service sees every process and owns the traps while it runs; local traps are removed.
-            self.detector.close()
-            for row in rows:
-                extra = state['processes'].get(f"{row['pid']}:{row['created']!r}")
-                if extra:
-                    row['exe'] = row['exe'] or extra['exe']
-                    row['disk'] = row['disk'] if row['disk'] is not None else extra['disk']
-            result['threats'], result['protection'] = state['threats'], 'root'
-        else:
-            result['threats'], result['protection'] = self.detector.assess(rows,len(times)), 'utente'
-        result['root_available'] = ROOT_TERMINATE.exists()
+        self.security(rows,len(times),result)
         self.last_net_ids = {name:d['identity'] for name,d in result['nets'].items()}
         self.net_hardware = {name:self.net_hardware[name] for name in result['nets']}
         gpus = gpu_devices()
-        clients = self._gpu_clients() if gpus else {}
+        clients = self._gpu_clients() if gpus and not self.light else {}
         for gpu in gpus:
             device = gpu['card'] / 'device'
             busy = number(device / 'gpu_busy_percent')

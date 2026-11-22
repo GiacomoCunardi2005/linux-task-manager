@@ -291,6 +291,73 @@ class Traps:
         (self.registry/f'{os.getpid()}.json').unlink(missing_ok=True)
 
 
+CLOCK_TICKS, PAGE_SIZE = os.sysconf('SC_CLK_TCK'), os.sysconf('SC_PAGE_SIZE')
+PROC_STATES = {'R':'running','S':'sleeping','D':'disk-sleep','T':'stopped','t':'tracing-stop','Z':'zombie',
+               'X':'dead','x':'dead','I':'idle','P':'parked','W':'waking','K':'wake-kill'}
+
+
+class ProcessScanner:
+    """Process rows for the app and the root service at a fraction of psutil's cost.
+
+    Every second only /proc/PID/stat (state, parent, CPU, threads, RSS) and /proc/PID/io are read; name,
+    executable, command line, user and start time never change for one process, so psutil reads them once
+    per new process. The start time must be psutil's: app and root service match rows on it.
+    """
+    def __init__(self):
+        self.last, self.static, self.time, self.cores = {}, {}, time.monotonic(), psutil.cpu_count() or 1
+        self.processes = self.threads = 0
+
+    @staticmethod
+    def describe(pid):
+        try:
+            info = psutil.Process(pid).as_dict(['create_time','name','exe','cmdline','uids','username'])
+        except psutil.Error:
+            return None
+        if info['create_time'] is None:
+            return None
+        return dict(created=info['create_time'],name=info['name'] or str(pid),exe=info['exe'],cmdline=info['cmdline'] or [],
+                    uid=info['uids'].real if info['uids'] else None,user=info['username'] or 'Non disponibile')
+
+    def rows(self):
+        now = time.monotonic()
+        dt, self.time = max(1e-3,now-self.time), now
+        rows, current, static = [], {}, {}
+        threads = 0
+        for entry in os.scandir('/proc'):
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                with open(f'/proc/{pid}/stat','rb') as handle:
+                    line = handle.read()
+                fields = line[line.rfind(b')')+2:].split()  # the name may contain spaces or ')'
+                state, ppid, start = fields[0].decode(), int(fields[1]), int(fields[19])
+                cpu_time = (int(fields[11])+int(fields[12]))/CLOCK_TICKS
+                count, rss = int(fields[17]), int(fields[21])*PAGE_SIZE
+            except (OSError,IndexError,ValueError):
+                continue  # exited meanwhile
+            key = (pid,start)
+            info = self.static.get(key) or self.describe(pid)
+            if info is None:
+                continue
+            static[key] = info
+            try:
+                with open(f'/proc/{pid}/io','rb') as handle:
+                    counters = dict(item.split(b': ') for item in handle.read().splitlines())
+                io_bytes = int(counters[b'read_bytes'])+int(counters[b'write_bytes'])
+            except (OSError,KeyError,ValueError):
+                io_bytes = None  # other users' processes without root
+            old_cpu,old_io = self.last.get(key,(None,None))
+            current[key] = (cpu_time,io_bytes)
+            threads += count
+            rows.append(dict(info,pid=pid,ppid=ppid,status=PROC_STATES.get(state,state),memory=rss,
+                cpu=min(100,max(0,cpu_time-old_cpu)/dt*100/self.cores) if old_cpu is not None else None,
+                disk=max(0,(io_bytes-old_io)/dt) if io_bytes is not None and old_io is not None else None))
+        self.last, self.static = current, static
+        self.processes, self.threads = len(rows), threads
+        return rows
+
+
 PROC_EVENT_EXEC = 0x2
 
 
