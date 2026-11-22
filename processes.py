@@ -8,7 +8,7 @@ import subprocess
 import psutil
 from PySide6.QtCore import Qt, QAbstractItemModel, QSortFilterProxyModel, QModelIndex, QStandardPaths, QItemSelectionModel
 from PySide6.QtGui import QColor, QIcon
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QDialog, QTreeWidget, QTreeWidgetItem,
     QPushButton, QTreeView, QHeaderView, QAbstractItemView, QMessageBox, QStyledItemDelegate, QStyle)
 from metrics import size, terminate_process, terminate_as_root
 
@@ -59,7 +59,7 @@ class ProcessModel(QAbstractItemModel):
         self.rows = []
         self.totals = {}
         self.threats, self.system_threats, self.threats_available, self.traps = {}, [], True, []
-        self.protection, self.root_available = 'utente', False
+        self.protection, self.root_available, self.network = 'utente', False, None
         self.fallback_icon = fallback_icon
         self.icons = {}
         icon_paths = [str(Path(path)/'icons') for path in QStandardPaths.standardLocations(QStandardPaths.GenericDataLocation)]
@@ -193,6 +193,7 @@ class ProcessModel(QAbstractItemModel):
         threats = data.get('threats')
         self.threats_available = threats is not None
         self.protection = data.get('protection','utente')
+        self.network = data.get('network')
         self.root_available = data.get('root_available',False)
         self.threats = {(f['pid'],f['created']):f for f in (threats or {}).get('processes',[])}
         self.system_threats = (threats or {}).get('system',[])
@@ -257,6 +258,11 @@ class ProcessPage(QWidget):
         self.pause = QPushButton('Sospendi')
         self.pause.clicked.connect(self.toggle_pause)
         actions.addWidget(self.pause)
+        self.network_button = QPushButton('Anomalie di rete')
+        self.network_button.setEnabled(False)
+        self.network_button.setToolTip('Richiede il servizio root: sudo ./install-root-service.sh')
+        self.network_button.clicked.connect(self.show_network)
+        actions.addWidget(self.network_button)
         self.end_task = QPushButton('Termina attività')
         self.end_task.setEnabled(False)
         self.end_task.clicked.connect(self.end_selected)
@@ -363,8 +369,17 @@ class ProcessPage(QWidget):
         self.selection_changed()
         self.update_status()
 
+    def show_network(self):
+        NetworkDialog(self,self.model.network).exec()
+
     def update_status(self):
         model = self.model
+        network = model.network
+        self.network_button.setEnabled(network is not None)
+        if network is not None:
+            worth = sum(1 for a in network['anomalies'] if a['score'] >= 40)
+            self.network_button.setText(f'Anomalie di rete ({worth})' if worth else 'Anomalie di rete')
+            self.network_button.setToolTip('Comunicazioni ordinate per punteggio di anomalia comportamentale')
         flagged = len(model.threats)
         system = model.system_threats
         if not model.threats_available:
@@ -440,3 +455,52 @@ class ProcessPage(QWidget):
             self.status.setText(f"{row['name']}: terminazione inviata a {sent} processi"+(f", {gone} già terminati" if gone else '')+'.')
         if errors:
             QMessageBox.warning(self,'Impossibile terminare','\n'.join(errors))
+
+
+NETWORK_KINDS = dict(destinazione='Destinazione',dga='Domini generati (DGA)',tunnel='Tunnel DNS',spike='Picco del dispositivo')
+
+
+class NetworkDialog(QDialog):
+    """Ranked behavioural network anomalies with their evidence: a list to investigate, not a verdict."""
+    def __init__(self,parent,network):
+        super().__init__(parent)
+        self.setWindowTitle('Anomalie di rete')
+        self.setStyleSheet('QDialog { background:#202020; }')
+        self.resize(900,560)
+        layout = QVBoxLayout(self)
+        features = network.get('features',{})
+        sources = ', '.join(name for key,name in (('capture','DNS e avvii di connessione'),('closes','byte per connessione'),('flows','connessioni lunghe'))
+                            if features.get(key)) or 'nessuna'
+        note = QLabel(('Baseline in costruzione (prime 24 ore): le destinazioni nuove non contano ancora. ' if network.get('learning') else '')
+            +'Punteggio 0–100 calcolato solo dal comportamento osservato su questo computer, senza elenchi di server malevoli: '
+            'più indicatori indipendenti fanno salire il punteggio. Non è una diagnosi: ordina ciò che merita uno sguardo. '
+            f'Fonti attive: {sources}. Non visibili: contenuti cifrati, DNS cifrato (DoH/DoT), traffico QUIC/UDP.')
+        note.setWordWrap(True)
+        note.setStyleSheet('color:#bdbdbd; font-size:11px; padding:4px;')
+        layout.addWidget(note)
+        tree = QTreeWidget()
+        tree.setHeaderLabels(['Punteggio','Comunicazione','Tipo','Processo'])
+        tree.setColumnWidth(0,90)
+        tree.setColumnWidth(1,420)
+        tree.setColumnWidth(2,160)
+        tree.setWordWrap(True)
+        for item in sorted(network['anomalies'],key=lambda a: -a['score']):
+            row = QTreeWidgetItem([f"{item['score']:.0f}",item['subject'],NETWORK_KINDS.get(item['kind'],item['kind']),item.get('process') or '—'])
+            color = QColor('#ff99a4' if item['score'] >= 70 else '#f5c26b' if item['score'] >= 40 else '#bdbdbd')
+            for column in range(4):
+                row.setForeground(column,color)
+            for line in item['evidence']:
+                child = QTreeWidgetItem([line])
+                child.setToolTip(0,line)
+                row.addChild(child)
+            tree.addTopLevelItem(row)
+            for index in range(row.childCount()):
+                row.child(index).setFirstColumnSpanned(True)  # evidence uses the whole row; only works once in the view
+        if not network['anomalies']:
+            tree.addTopLevelItem(QTreeWidgetItem(['','Nessuna comunicazione anomala finora']))
+        if tree.topLevelItemCount() <= 5:
+            tree.expandToDepth(0)
+        layout.addWidget(tree)
+        close = QPushButton('Chiudi')
+        close.clicked.connect(self.accept)
+        layout.addWidget(close,0,Qt.AlignRight)

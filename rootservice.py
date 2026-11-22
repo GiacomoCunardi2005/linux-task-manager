@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parent))  # python -I does not add the script folder
 import psutil
 from detection import Detector, Traps, ExecWatcher, ProcessScanner, crontab, default_places
+from netwatch import NetWatch
 
 CONFIG = Path('/etc/linux-task-manager/service.json')
 # Root-owned ignore list: a user-writable one would let user-level malware switch the checks off.
@@ -32,10 +33,25 @@ def load_user(config=CONFIG):
 Sampler = ProcessScanner  # shared with the app
 
 
-def state(rows,threats,uid,features):
+def network_findings(anomalies):
+    """Only the top of the ranking becomes an alert; the reason stays stable so a notification is not repeated."""
+    found = []
+    for item in anomalies:
+        if item['score'] >= 70:
+            names = ', '.join(INDICATORS.get(i,i) for i in item.get('indicators',[])) or item['kind']
+            found.append(dict(severity='alta' if item['score'] >= 90 else 'media',
+                reason=f"Rete: comportamento anomalo — {item['subject']} ({names})"+(f", processo {item['process']}" if item.get('process') else '')))
+    return found
+
+
+INDICATORS = dict(beacon='periodico',sizes='dimensioni costanti',persist='persistente',new='destinazione nuova',volume='molti dati inviati',
+                  short='connessioni brevissime',iforest='profilo insolito',dnsfirst='DNS prima di ogni connessione')
+
+
+def state(rows,threats,uid,features,network=None):
     # Only fields the unprivileged app cannot read itself for other users' processes.
     extra = {f"{r['pid']}:{r['created']!r}":dict(exe=r['exe'],disk=r['disk']) for r in rows if r['uid'] != uid}
-    return dict(version=1,time=time.time(),user=uid,threats=threats,processes=extra,features=features)
+    return dict(version=1,time=time.time(),user=uid,threats=threats,processes=extra,features=features,network=network)
 
 
 def write_state(data,gid,path=None):
@@ -68,15 +84,21 @@ def run():
         watcher = None
         print(f'Processi brevi non osservabili: {exc}',file=sys.stderr)
     sampler = Sampler()
+    watch = NetWatch(Path('/var/lib/linux-task-manager/network.json'),uid=user.pw_uid).start()
     try:
         while not stop:
             started = time.monotonic()
             rows = sampler.rows()
             threats = detector.assess(rows,sampler.cores)
             features['fanotify'] = traps.fan is not None
-            write_state(state(rows,threats,user.pw_uid,features),user.pw_gid)
+            anomalies = watch.poll()
+            threats['system'] += network_findings(anomalies)
+            network = dict(anomalies=anomalies,features=watch.features,
+                           learning=time.time()-watch.analyzer.base['started'] < 24*3600)
+            write_state(state(rows,threats,user.pw_uid,features,network),user.pw_gid)
             time.sleep(max(0,1-(time.monotonic()-started)))
     finally:
+        watch.close()
         detector.close()
         if watcher:
             watcher.close()

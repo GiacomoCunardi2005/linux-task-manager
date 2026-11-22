@@ -108,6 +108,44 @@ class LightSampleTests(unittest.TestCase):
             window.close()
 
 
+class NetworkIntegrationTests(unittest.TestCase):
+    ANOMALIES = [dict(subject='update-check.example (203.0.113.9:443)',key='203.0.113.9:443',kind='destinazione',score=93.5,
+                      evidence=['comunicazione periodica ogni 60 s','destinazione mai vista prima di oggi'],indicators=['beacon','new','sizes'],process='curl (PID 42)'),
+                 dict(subject='Dominio exfil-example.net',kind='tunnel',score=72.,evidence=['120 sottodomini diversi'],process=None),
+                 dict(subject='198.51.100.7:443',kind='destinazione',score=30.,evidence=['profilo insolito'],indicators=['iforest'],process=None)]
+
+    def test_only_high_scores_become_alerts_with_stable_text(self):
+        found = rootservice.network_findings(self.ANOMALIES)
+        self.assertEqual([f['severity'] for f in found],['alta','media'])
+        self.assertIn('periodico, destinazione nuova, dimensioni costanti',found[0]['reason'])
+        self.assertIn('processo curl (PID 42)',found[0]['reason'])
+        self.assertNotIn('93',found[0]['reason'])  # the score changes every 30 s; the alert text must not
+
+    def test_network_ranking_validation(self):
+        from metrics import valid_network
+        self.assertTrue(valid_network(None))
+        self.assertTrue(valid_network(dict(anomalies=self.ANOMALIES,features={},learning=False)))
+        for bad in (dict(anomalies='x'),dict(anomalies=[dict(self.ANOMALIES[0],score=101)]),
+                    dict(anomalies=[dict(self.ANOMALIES[0],evidence=[5])]),dict(anomalies=[dict(self.ANOMALIES[0],process=3)])):
+            self.assertFalse(valid_network(bad))
+
+    def test_dialog_lists_ranking_with_evidence(self):
+        from PySide6.QtWidgets import QTreeWidget
+        import test_ui
+        test_ui.UITests.setUpClass()
+        from processes import NetworkDialog
+        dialog = NetworkDialog(None,dict(anomalies=self.ANOMALIES,features=dict(capture=True,closes=True,flows=True),learning=True))
+        tree = dialog.findChild(QTreeWidget)
+        rows = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+        self.assertEqual([r.text(0) for r in rows],['94','72','30'])
+        self.assertEqual(rows[0].text(3),'curl (PID 42)')
+        self.assertEqual(rows[0].child(1).text(0),'destinazione mai vista prima di oggi')
+        self.assertTrue(rows[0].isFirstColumnSpanned() is False and rows[0].child(0).isFirstColumnSpanned())
+        self.assertIn('Baseline in costruzione',dialog.findChild(type(dialog.layout().itemAt(0).widget())).text())
+        Path('reference').mkdir(exist_ok=True)
+        dialog.grab().save('reference/linux-network-anomalies.png')
+
+
 class RootServiceTests(unittest.TestCase):
     def test_sampler_state_and_atomic_private_write(self):
         sampler = rootservice.Sampler()

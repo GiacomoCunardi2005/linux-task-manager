@@ -21,8 +21,8 @@ if [[ "${1:-}" == --uninstall ]]; then
     exit 0
 fi
 
-/usr/bin/python3 -c 'import psutil' 2>/dev/null || {
-    echo "Manca psutil per il Python di sistema. Installa: sudo pacman -S python-psutil (Arch/CachyOS) oppure sudo apt install python3-psutil" >&2
+/usr/bin/python3 -c 'import psutil, numpy' 2>/dev/null || {
+    echo "Mancano psutil o numpy per il Python di sistema. Installa: sudo pacman -S python-psutil python-numpy (Arch/CachyOS) oppure sudo apt install python3-psutil python3-numpy" >&2
     exit 1
 }
 command -v pkexec >/dev/null || echo "Avviso: pkexec non trovato, non potrai chiudere processi di root dall'app." >&2
@@ -30,7 +30,7 @@ home="$(getent passwd "$user" | cut -d: -f6)"
 [[ -d "$home" ]] || { echo "Cartella home di $user non trovata." >&2; exit 1; }
 
 install -d -m 0755 -o root -g root "$dest" /etc/linux-task-manager
-install -m 0644 -o root -g root "$src/rootservice.py" "$src/detection.py" "$src/agents.py" "$dest/"
+install -m 0644 -o root -g root "$src/rootservice.py" "$src/detection.py" "$src/agents.py" "$src/netbehavior.py" "$src/netwatch.py" "$dest/"
 cat > "$dest/terminate" <<'SH'
 #!/bin/sh
 exec /usr/bin/python3 -I -B /opt/linux-task-manager-root/rootservice.py terminate "$@"
@@ -66,7 +66,7 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
 
 [Install]
 WantedBy=multi-user.target

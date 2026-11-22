@@ -30,6 +30,8 @@ def root_state(path=ROOT_STATE, owner=0):
         if data.get('version') != 1 or data.get('user') != os.getuid() or not abs(time.time()-data.get('time',0)) < 5:
             return None
         validate_threats(data['threats'])
+        if not valid_network(data.get('network')):
+            return None
         extra = data['processes']
         if not isinstance(extra, dict) or not all(isinstance(v, dict) and isinstance(v.get('exe'), (str, type(None)))
                 and isinstance(v.get('disk'), (int, float, type(None))) for v in extra.values()):
@@ -37,6 +39,19 @@ def root_state(path=ROOT_STATE, owner=0):
         return data
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
+
+
+def valid_network(network):
+    """Shape of the behavioural network ranking published by the root service (absent on older services)."""
+    if network is None:
+        return True
+    if not isinstance(network, dict) or not isinstance(network.get('anomalies'), list) or len(network['anomalies']) > 200:
+        return False
+    text = lambda v: isinstance(v, str) and len(v) < 2000
+    return all(isinstance(a, dict) and text(a.get('subject')) and text(a.get('kind'))
+               and isinstance(a.get('score'), (int, float)) and 0 <= a['score'] <= 100
+               and isinstance(a.get('evidence'), list) and len(a['evidence']) <= 30 and all(text(e) for e in a['evidence'])
+               and (a.get('process') is None or text(a['process'])) for a in network['anomalies'])
 
 
 def rate(current, previous, elapsed):
@@ -208,9 +223,9 @@ class Monitor:
                 if extra:
                     row['exe'] = row['exe'] or extra['exe']
                     row['disk'] = row['disk'] if row['disk'] is not None else extra['disk']
-            result['threats'], result['protection'] = state['threats'], 'root'
+            result['threats'], result['protection'], result['network'] = state['threats'], 'root', state.get('network')
         else:
-            result['threats'], result['protection'] = self.detector.assess(rows,cores), 'utente'
+            result['threats'], result['protection'], result['network'] = self.detector.assess(rows,cores), 'utente', None
         result['root_available'] = ROOT_TERMINATE.exists()
 
     def sample(self):

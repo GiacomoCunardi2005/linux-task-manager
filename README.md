@@ -106,6 +106,23 @@ Hook, skill, plugin e server MCP degli agenti di programmazione sono codice che 
 
 Viene salvata un’impronta di ogni hook, server MCP e comando dinamico (`~/.cache/linux-task-manager/agents.json`, servizio root: `/var/lib/linux-task-manager/agents.json`). Se uno compare o cambia dopo il primo controllo, l’avviso «nuovi o modificati dall’ultimo controllo» resta per 24 ore: difende dal *rug pull*, cioè un’estensione approvata quando era innocua e cambiata dopo. Un aggiornamento dei plugin fatto da te produce lo stesso avviso. Per escludere un elemento aggiungere alla lista delle eccezioni l’etichetta mostrata (per esempio `Server MCP «playwright» (~/.claude.json)`); la riga `agenti` disattiva tutto il controllo. Non vengono letti i *contenuti* restituiti dai server MCP in esecuzione (descrizioni degli strumenti), quindi l’avvelenamento delle descrizioni non è rilevabile da qui.
 
+### Anomalie di rete (servizio root)
+
+Il servizio root osserva **solo il comportamento** delle comunicazioni: nessun elenco di server malevoli, nessuna firma, nessun modello addestrato su malware. Ogni comunicazione riceve un **punteggio 0–100** che combina indicatori indipendenti (un indicatore da solo resta basso; più indicatori insieme lo alzano). Il pulsante **Anomalie di rete** della pagina Processi mostra la classifica con le evidenze di ogni voce; solo i punteggi da 70 in su diventano avvisi («Da verificare», da 90 «Sospetto»). È un elenco di ciò che merita uno sguardo, non una diagnosi.
+
+Fonti, tutte dal kernel e senza leggere contenuti: cattura filtrata con BPF dei soli pacchetti DNS e degli avvii di connessione TCP (orari esatti del kernel); eventi di chiusura dei socket (`sock_diag`) con i byte finali di ogni connessione, anche se dura 200 ms; contatori di `ss` ogni 5 secondi per le connessioni lunghe; `loginctl` per sapere se l’utente è inattivo.
+
+Indicatori:
+- **Beaconing**: contatti a intervalli regolari verso la stessa destinazione, tollerando jitter e battiti mancati; contano la regolarità e il coefficiente di variazione degli intervalli (il traffico casuale ha CV intorno a 0,27, un beacon sotto 0,2), dimensioni quasi costanti, persistenza nelle ore, richiesta DNS prima di ogni connessione. Vale anche per i «battiti» dentro una sola connessione lunga. Un ritmo presente da più di 3 giorni (posta, sincronizzazione, chat) è considerato un’abitudine e pesa molto meno.
+- **DGA**: molti domini diversi inesistenti (NXDOMAIN) in 15 minuti, con nomi casuali (entropia, cifre, poche vocali), di lunghezza simile e mai visti prima.
+- **Tunnel DNS**: molti sottodomini lunghi, diversi e ad alta entropia verso lo stesso dominio, etichette da dati codificati, richieste TXT/NULL.
+- **Volumi**: molti dati inviati rispetto a quelli ricevuti (possibile esfiltrazione); picchi del dispositivo in connessioni, destinazioni diverse o byte inviati rispetto alla propria storia (z robusto con mediana e MAD).
+- **Destinazioni**: destinazioni mai viste (dopo le prime 24 ore), connessioni brevissime e ripetute.
+- **Correlazione temporale**: attività mentre l’utente è inattivo, DNS seguito dalla connessione.
+- **Isolation Forest** (non supervisionato) addestrato ogni 10 minuti sui profili delle destinazioni osservati su questo computer: segnala quelle che si isolano con poche suddivisioni casuali.
+
+La baseline locale (destinazioni, domini, ritmi abituali, storia del dispositivo, profili per l’Isolation Forest) è in `/var/lib/linux-task-manager/network.json`; le prime 24 ore servono a costruirla. Il processo responsabile viene cercato solo per le voci con punteggio da 40 in su. Limiti: DNS cifrato (DoH/DoT) e traffico QUIC/UDP non sono visibili; il contenuto cifrato non viene letto; un malware che imita perfettamente il traffico abituale può passare inosservato; anche programmi legittimi possono essere periodici o inviare molti dati, per questo conta la combinazione di indicatori. Le prove simulate tengono il traffico di navigazione casuale sotto 40 e un beacon C2 nuovo sopra 90.
+
 ### Processi di breve durata
 
 Il kernel avvisa a ogni avvio di programma (proc connector), quindi anche i processi che durano meno del campionamento di 1 secondo vengono controllati: l’app legge `/proc` subito dopo l’avvio e un processo terminato in un millisecondo con un eseguibile in `/dev/shm` viene comunque segnalato. Su questo kernel funziona anche senza root; per i processi di altri utenti senza servizio root l’eseguibile non è leggibile e valgono i controlli su nome e riga di comando. Sono controllati anche i file di avvio di sistema (`/etc/cron.d`, `/etc/crontab`, unità systemd in `/etc/systemd/system`, `/etc/xdg/autostart`, `/etc/profile.d`) e `/etc/ld.so.preload`, che carica una libreria in ogni programma ed è una tecnica tipica dei rootkit.
@@ -117,7 +134,7 @@ Limiti: senza servizio root, per i processi di altri utenti eseguibile e conness
 ## Verifica
 
 ```bash
-.venv/bin/python -m unittest -v test_metrics test_ui test_processes test_hardware test_process_network test_detection test_rootservice test_agents
+.venv/bin/python -m unittest -v test_metrics test_ui test_processes test_hardware test_process_network test_detection test_rootservice test_agents test_netbehavior test_netwatch
 ```
 
 Test della contabilizzazione CPU, reset dei contatori, coerenza dei dati Linux e interazione delle viste Qt (risorse, pausa, processori logici, copia, finestra compatta). La cartella locale `reference/` non viene pubblicata: può contenere schermate con dati del computer e riferimenti esterni. I test UI producono schermate reali in `reference/linux-*.png` usando Qt offscreen.
