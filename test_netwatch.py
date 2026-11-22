@@ -48,8 +48,10 @@ for i in range(5):
     client.sendto(query(''.join(random.choice('qwxzjkv0123') for _ in range(14)) + '.com', 10 + i), ('127.0.0.53', 53)); client.recv(512)
 long = socket.create_connection(('127.0.0.9', 9443)); long.sendall(b'y' * 1234); time.sleep(.3)
 flows = watch.flows()
-time.sleep(.5)
 a = watch.analyzer
+deadline = time.time() + 5
+while len(a.conns) < 3 and time.time() < deadline:  # close events can lag under load
+    time.sleep(.05)
 print(json.dumps(dict(
     features=watch.features,
     syns=len(a.events.get('127.0.0.9:8443', [])),

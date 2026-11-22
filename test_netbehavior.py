@@ -77,9 +77,11 @@ class DnsTests(unittest.TestCase):
         for i in range(30):
             name = ''.join(rng.choice('abcdefghijklmnopqrstuvwxyz0123456789') for _ in range(16))+'.com'
             analyzer.dns_event(NOW-600+i*10,name,1,3,True)
+            analyzer.dns_event(NOW-600+i*10+.01,name,1,3,True)  # every answer is seen twice: stub and upstream
         result = top(analyzer.analyze(NOW),'dga')
         self.assertGreater(result['score'],60)
         self.assertIn('NXDOMAIN',result['evidence'][0])
+        self.assertIn('100% mai visti prima',result['evidence'][1])
 
     def test_a_few_typos_are_not_dga(self):
         analyzer = learnt()

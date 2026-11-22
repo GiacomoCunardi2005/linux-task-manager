@@ -181,7 +181,7 @@ class NetworkAnalyzer:
         for ip in ips:
             self.ip_domain[ip] = qname
             self.dns_seen_at[ip] = t
-        if response:
+        if response and rcode == 0:  # only names that exist become "known"; a failed lookup must stay unseen
             entry = self.base['domains'].setdefault(registered(qname),[t,t,0])
             entry[1], entry[2] = t, entry[2]+1
 
@@ -288,7 +288,7 @@ class NetworkAnalyzer:
             likeness = statistics.mean(dga_likeness(n) for n in failing)
             lengths = Counter(len(registered(n).split('.')[0]) for n in failing)
             similar = lengths.most_common(1)[0][1]/len(failing)
-            unseen = sum(1 for n in failing if self.base['domains'].get(registered(n),[0,0,0])[2] <= 1)/len(failing)
+            unseen = sum(1 for n in failing if registered(n) not in self.base['domains'])/len(failing)
             strength = min(1,(len(failing)-5)/20)*(.4+.6*likeness)*(.6+.4*unseen)
             if similar > .6:
                 strength = min(1,strength*1.2)
