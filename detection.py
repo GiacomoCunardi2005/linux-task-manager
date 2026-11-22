@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
 import stat
 import struct
 import subprocess
+import threading
 import time
 import psutil
 
@@ -26,6 +28,9 @@ STARTUP_EXEC = re.compile(r'^\s*Exec\w*\s*=\s*\S*(/dev/shm|/run/shm|/tmp|/var/tm
 PORTS = {3333:'pool di mining',4444:'shell remota o pool di mining',5555:'pool di mining',7777:'pool di mining',
          14433:'pool di mining',14444:'pool di mining',45700:'pool di mining',1337:'backdoor',31337:'backdoor',6667:'IRC usato da botnet'}
 STARTUP_FILES = ('.bashrc','.bash_profile','.profile','.zshrc','.zprofile','.xprofile','.config/fish/config.fish')
+# System-wide autostart locations, readable by normal users too.
+SYSTEM_STARTUP = ('/etc/crontab','/etc/cron.d/*','/etc/rc.local','/etc/profile.d/*.sh','/etc/xdg/autostart/*.desktop',
+                  '/etc/systemd/system/*.service','/etc/systemd/system/*.timer')
 STARTUP_GLOBS = ('.config/autostart/*.desktop','.config/systemd/user/**/*.service','.config/systemd/user/**/*.timer','.config/environment.d/*.conf')
 MINER_SECONDS, MINER_CORES = 120, 1.0
 RANK = {'media':1,'alta':2}
@@ -244,17 +249,105 @@ class Traps:
         (self.registry/f'{os.getpid()}.json').unlink(missing_ok=True)
 
 
-def crontab():
+PROC_EVENT_EXEC = 0x2
+
+
+def parse_proc_events(data):
+    """(pid, tgid) of every exec event in a netlink proc-connector datagram."""
+    events, offset = [], 0
+    while offset+16 <= len(data):
+        length = struct.unpack_from('I',data,offset)[0]
+        if length < 16:
+            break
+        body = offset+16+20  # nlmsghdr + cn_msg
+        if body+24 <= offset+length:
+            what = struct.unpack_from('I',data,body)[0]
+            if what == PROC_EVENT_EXEC:
+                events.append(struct.unpack_from('ii',data,body+16))
+        offset += (length+3) & ~3
+    return events
+
+
+class ExecWatcher(threading.Thread):
+    """Linux proc connector: notified on every exec(), so processes shorter than the 1 s sample are seen."""
+    def __init__(self,detector):
+        super().__init__(daemon=True)
+        self.detector = detector
+        self.sock = socket.socket(socket.AF_NETLINK,socket.SOCK_DGRAM,11)  # NETLINK_CONNECTOR
+        self.sock.bind((0,1))  # CN_IDX_PROC multicast group
+        message = struct.pack('IHHII',16+20+4,3,0,0,0)+struct.pack('IIIIHH',1,1,0,0,4,0)+struct.pack('I',1)  # PROC_CN_MCAST_LISTEN
+        self.sock.send(message)
+
+    def run(self):
+        while True:
+            try:
+                data = self.sock.recv(65536)
+            except OSError:
+                return
+            for pid,tgid in parse_proc_events(data):
+                if pid == tgid:
+                    row = self.snapshot(tgid)
+                    if row:
+                        self.detector.exec_seen(row)
+
+    @staticmethod
+    def snapshot(pid):
+        """Raw /proc reads, fastest first: the process may exit within milliseconds of exec()."""
+        base = f'/proc/{pid}/'
+        try:
+            exe = os.readlink(base+'exe')
+        except OSError:
+            exe = None  # other users' processes without root
+        try:
+            with open(base+'cmdline','rb') as handle:
+                cmdline = [arg.decode(errors='replace') for arg in handle.read().split(b'\0') if arg]
+            with open(base+'stat','rb') as handle:
+                stat_line = handle.read().decode(errors='replace')
+            created = psutil.Process(pid).create_time()
+        except (OSError,psutil.Error):
+            return None
+        name = stat_line[stat_line.find('(')+1:stat_line.rfind(')')]
+        ppid = int(stat_line[stat_line.rfind(')')+2:].split()[1])
+        return dict(pid=pid,created=created,name=name,exe=exe and exe.removesuffix(' (deleted)'),cmdline=cmdline,ppid=ppid)
+
+    def close(self):
+        self.sock.close()
+
+
+def validate_threats(threats):
+    """Shape check for findings read from the root service file."""
+    def ok(value,names,check):
+        if not isinstance(value,dict) or any(name not in value or not check(value[name]) for name in names.split()):
+            raise ValueError('Dati del servizio root non validi.')
+    ok(threats,'processes system traps',lambda v:isinstance(v,list) and len(v) <= 4096)
+    for finding in threats['processes']:
+        ok(finding,'pid',lambda v:type(v) is int and 0 < v < 2**31)
+        ok(finding,'created',lambda v:isinstance(v,(int,float)) and not isinstance(v,bool))
+        ok(finding,'reasons',lambda v:isinstance(v,list) and 0 < len(v) <= 32 and all(isinstance(s,str) for s in v))
+    for finding in threats['processes']+threats['system']:
+        ok(finding,'severity',lambda v:v in ('media','alta'))
+    for finding in threats['system']:
+        ok(finding,'reason',lambda v:isinstance(v,str))
+    if not all(isinstance(s,str) for s in threats['traps']):
+        raise ValueError('Dati del servizio root non validi.')
+    return threats
+
+
+def crontab(user=None):
     try:
-        result = subprocess.run(['crontab','-l'],capture_output=True,text=True,timeout=2)
+        result = subprocess.run(['crontab','-l']+(['-u',user] if user else []),capture_output=True,text=True,timeout=2)
         return result.stdout if result.returncode == 0 else ''
     except (OSError,subprocess.SubprocessError):
         return ''
 
 
 class Detector:
-    def __init__(self,home=None,proc=Path('/proc'),usb_root=Path('/sys/bus/usb/devices'),config=None,read_crontab=crontab,traps=None):
+    def __init__(self,home=None,proc=Path('/proc'),usb_root=Path('/sys/bus/usb/devices'),config=None,read_crontab=crontab,traps=None,
+                 preload=Path('/etc/ld.so.preload'),system_startup=SYSTEM_STARTUP):
         self.home = Path(home or Path.home())
+        self.system_startup = system_startup
+        self.preload = Path(preload)
+        self.exec_lock, self.exec_pending, self.short_lived = threading.Lock(), {}, []
         self.proc, self.usb_root, self.read_crontab = Path(proc), Path(usb_root), read_crontab
         self.config = Path(config or Path(os.environ.get('XDG_CONFIG_HOME',self.home/'.config'))/'linux-task-manager'/'detection-ignore.txt')
         self.traps = Traps() if traps is None else traps
@@ -308,8 +401,18 @@ class Detector:
             return self.startup
         self.startup_time, found = now, []
         files = [self.home/name for name in STARTUP_FILES]+[path for pattern in STARTUP_GLOBS for path in sorted(self.home.glob(pattern))]
-        texts = [(str(path),path.read_text(encoding='utf-8',errors='replace')[:262144]) for path in files if path.is_file()]
+        files += [path for pattern in self.system_startup for path in sorted(Path('/').glob(pattern.lstrip('/')))]
+        texts = []
+        for path in files:
+            try:
+                if path.is_file():
+                    texts.append((str(path),path.read_text(encoding='utf-8',errors='replace')[:262144]))
+            except OSError:
+                continue  # e.g. root-only system files when running as a user
         texts.append(('crontab utente',self.read_crontab()))
+        preload = read(self.preload)
+        if preload and '/etc/ld.so.preload' not in ignored:
+            found.append(dict(severity='alta',reason=f'/etc/ld.so.preload carica {preload.split()[0]} in ogni programma: tecnica tipica dei rootkit'))
         for label,text in texts:
             if label in ignored:
                 continue
@@ -337,7 +440,8 @@ class Detector:
         now = time.monotonic() if now is None else now
         ignored = self.ignored()
         sockets = self.socket_ports(now)
-        trap_hits = self.trap_findings(ignored)
+        # A trap opener whose name is on the ignore list (e.g. a backup tool) is not reported.
+        trap_hits = [h for h in self.trap_findings(ignored) if not h['names'] or not set(h['names']) <= ignored]
         trapped = {}
         for hit in trap_hits:
             for pid in hit['pids']:
@@ -362,6 +466,7 @@ class Detector:
                     reasons.append(('media',f'Usa almeno un core intero da {MINER_SECONDS//60} minuti con un eseguibile fuori dalle cartelle di sistema'))
             if reasons:
                 processes.append(dict(pid=row['pid'],created=row['created'],severity=max((r[0] for r in reasons),key=RANK.get),reasons=[r[1] for r in reasons]))
+        self.collect_short_lived(alive,ignored)
         self.static = {k:v for k,v in self.static.items() if k in alive}
         self.cpu = {k:v for k,v in self.cpu.items() if k in alive}
         system = []
@@ -370,8 +475,26 @@ class Detector:
                 system += part()
             except OSError as exc:
                 system.append(dict(severity='media',reason=f'Controllo non completato: {exc}'))
-        system += [dict(severity=hit['severity'],reason=hit['reason']) for hit in trap_hits]
+        system += [dict(severity=hit['severity'],reason=hit['reason']) for hit in trap_hits]+list(self.short_lived)
         return dict(processes=processes,system=system,traps=[str(p) for p,_ in self.traps.paths.values()] if self.traps else [])
+
+    def exec_seen(self,row):
+        """Called by ExecWatcher right after exec(): judge the process before it can exit."""
+        reasons = self.static_reasons(row)
+        if reasons and len(self.exec_pending) < 1000:
+            with self.exec_lock:
+                self.exec_pending[(row['pid'],row['created'])] = (row,reasons,time.strftime('%H:%M:%S'))
+
+    def collect_short_lived(self,alive,ignored):
+        # Processes still alive are reported by the normal row checks; the rest ended before the 1 s sample.
+        with self.exec_lock:
+            pending, self.exec_pending = self.exec_pending, {k:v for k,v in self.exec_pending.items() if k in alive}
+        for identity,(row,reasons,clock) in pending.items():
+            if identity in alive or row['name'] in ignored or row.get('exe') in ignored:
+                continue
+            self.short_lived.append(dict(severity=max((r[0] for r in reasons),key=RANK.get),
+                reason=f"{clock} processo di breve durata PID {row['pid']} ({row['name']}): "+'; '.join(r[1] for r in reasons)))
+        del self.short_lived[:-50]
 
     def trap_findings(self,ignored):
         if not self.traps or 'trappole' in ignored:

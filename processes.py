@@ -4,12 +4,13 @@ import configparser
 import math
 from pathlib import Path
 import shlex
+import subprocess
 import psutil
 from PySide6.QtCore import Qt, QAbstractItemModel, QSortFilterProxyModel, QModelIndex, QStandardPaths, QItemSelectionModel
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTreeView, QHeaderView, QAbstractItemView, QMessageBox, QStyledItemDelegate, QStyle)
-from metrics import size, terminate_process
+from metrics import size, terminate_process, terminate_as_root
 
 HEADERS = ['Nome','Stato','CPU','Memoria','Disco','Rete','PID']
 STATES = {'running':'In esecuzione','sleeping':'In attesa','disk-sleep':'Attesa disco',
@@ -58,6 +59,7 @@ class ProcessModel(QAbstractItemModel):
         self.rows = []
         self.totals = {}
         self.threats, self.system_threats, self.threats_available, self.traps = {}, [], True, []
+        self.protection, self.root_available = 'utente', False
         self.fallback_icon = fallback_icon
         self.icons = {}
         icon_paths = [str(Path(path)/'icons') for path in QStandardPaths.standardLocations(QStandardPaths.GenericDataLocation)]
@@ -190,6 +192,8 @@ class ProcessModel(QAbstractItemModel):
         self.rows = process_groups(data['process_rows'])
         threats = data.get('threats')
         self.threats_available = threats is not None
+        self.protection = data.get('protection','utente')
+        self.root_available = data.get('root_available',False)
         self.threats = {(f['pid'],f['created']):f for f in (threats or {}).get('processes',[])}
         self.system_threats = (threats or {}).get('system',[])
         self.traps = (threats or {}).get('traps',[])
@@ -317,8 +321,9 @@ class ProcessPage(QWidget):
         """Processes of the selection that may be stopped: the row itself, or every child of a group."""
         if not row:
             return []
-        return [p for p in row.get('children',[row]) if p['uid'] == os.getuid() and p['created'] is not None
-                and p['pid'] is not None and p['pid'] not in (0,1,os.getpid())]
+        # Other users' processes only through the installed root helper (admin password); kernel threads never.
+        return [p for p in row.get('children',[row]) if (p['uid'] == os.getuid() or self.model.root_available)
+                and p['created'] is not None and p['pid'] is not None and p['pid'] not in (0,1,2,os.getpid()) and p.get('ppid') != 2]
 
     def selection_changed(self,*args):
         row = self.selected()
@@ -369,11 +374,15 @@ class ProcessPage(QWidget):
                 +([f'{len(system)} avvisi di sistema (dettagli nel tooltip)'] if system else []))
         else:
             security = ' · Nessun comportamento sospetto rilevato'
+        root = model.protection == 'root'
+        security += ' · Protezione root attiva' if root else ' · Protezione base (utente)'
         self.status.setText(f"{getattr(model,'process_count',0)} processi · {self.proxy.rowCount()} applicazioni/voci · "+(self.latest.get('process_network_status','Rete in attesa') if self.latest else 'Rete in attesa')+security+(' · Aggiornamento sospeso' if self.paused else ''))
         alarm = any(f['severity'] == 'alta' for f in list(model.threats.values())+system)
         self.status.setStyleSheet('padding:8px 16px; font-size:11px; color:'+('#ff99a4' if alarm else '#f5c26b' if flagged or system else '#bdbdbd')+';')
         self.status.setToolTip('\n'.join(f"Rischio {f['severity']}: {f['reason']}" for f in system)+('\n' if system else '')
-            +'Controlli euristici sui dati raccolti: non sostituiscono un antivirus. Eccezioni: ~/.config/linux-task-manager/detection-ignore.txt'
+            +'Controlli euristici sui dati raccolti: non sostituiscono un antivirus. '
+            +('Servizio root attivo: vede tutti i processi, chi apre le trappole e i processi brevi. Eccezioni: /etc/linux-task-manager/ignore.txt' if root else
+              'Servizio root non attivo: installalo con sudo ./install-root-service.sh. Eccezioni: ~/.config/linux-task-manager/detection-ignore.txt')
             +('\nTrappole attive (non aprirle): '+', '.join(model.traps) if model.traps else '\nNessuna trappola attiva'))
 
     def toggle_pause(self):
@@ -393,12 +402,17 @@ class ProcessPage(QWidget):
             question = f"Terminare tutti i {len(targets)} processi di {row['name']} (PID {pids})?"
         else:
             question = f"Terminare {row['name']} (PID {row['pid']})?"
+        others = [p for p in targets if p['uid'] != os.getuid()]
+        if others:
+            question += f"\n{'Il processo appartiene' if len(others) == 1 else f'{len(others)} processi appartengono'} a un altro utente o a root: verrà chiesta la password di amministratore."
         answer = QMessageBox.question(self,'Termina attività',question+'\nI dati non salvati potrebbero andare persi.',
             QMessageBox.Yes | QMessageBox.No,QMessageBox.No)
         if answer != QMessageBox.Yes:
             return
         sent, gone, errors = 0, 0, []
         for target in targets:
+            if target in others:
+                continue
             try:
                 terminate_process(target['pid'],target['created'])
                 sent += 1
@@ -406,6 +420,19 @@ class ProcessPage(QWidget):
                 gone += 1
             except (psutil.AccessDenied,PermissionError,ValueError) as exc:
                 errors.append(f"PID {target['pid']}: {exc}")
+        if others:
+            try:
+                outcomes = terminate_as_root([(p['pid'],p['created']) for p in others])
+                for target in others:
+                    outcome = outcomes.get(str(target['pid']),'nessuna risposta')
+                    if outcome == 'inviato':
+                        sent += 1
+                    elif outcome == 'già terminato':
+                        gone += 1
+                    else:
+                        errors.append(f"PID {target['pid']}: {outcome}")
+            except (PermissionError,OSError,subprocess.SubprocessError) as exc:
+                errors += [f"PID {p['pid']}: {exc}" for p in others]
         if 'children' not in row:
             self.status.setText(f"Richiesta di terminazione inviata a {row['name']} (PID {row['pid']})." if sent else
                 'Il processo è già terminato o il PID è cambiato.' if gone else self.status.text())

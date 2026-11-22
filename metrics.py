@@ -1,15 +1,42 @@
-"""Linux counters and identity-checked process termination; no root or shell commands."""
+"""Linux counters and identity-checked process termination. Root work happens only in the separate rootservice."""
 from pathlib import Path
+import json
 import re
 import os
+import stat
 import socket
 import subprocess
 from collections import Counter
 import time
 import psutil
 from process_network import ProcessNetwork
-from detection import Detector
+from detection import Detector, ExecWatcher, validate_threats
 from hardware import read, number, disk_devices, gpu_devices, npu_devices, wifi_link, link_details, network_identity, connection_devices, network_hardware
+
+
+ROOT_STATE = Path('/run/linux-task-manager/state.json')
+ROOT_TERMINATE = Path('/opt/linux-task-manager-root/terminate')
+
+
+def root_state(path=ROOT_STATE, owner=0):
+    """Findings of the root service, trusted only from a fresh root-owned file nobody else can write."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(fd, 'rb') as handle:
+            info = os.fstat(handle.fileno())
+            data = json.loads(handle.read(8*1024*1024))
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != owner or info.st_mode & 0o022:
+            return None
+        if data.get('version') != 1 or data.get('user') != os.getuid() or not abs(time.time()-data.get('time',0)) < 5:
+            return None
+        validate_threats(data['threats'])
+        extra = data['processes']
+        if not isinstance(extra, dict) or not all(isinstance(v, dict) and isinstance(v.get('exe'), (str, type(None)))
+                and isinstance(v.get('disk'), (int, float, type(None))) for v in extra.values()):
+            return None
+        return data
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
 
 
 def rate(current, previous, elapsed):
@@ -117,6 +144,12 @@ class Monitor:
         self.last_cpu = psutil.cpu_times(percpu=True)
         self.process_network = ProcessNetwork()
         self.detector = Detector()
+        try:
+            # The proc connector accepts unprivileged listeners on this kernel; without it, 1 s sampling still applies.
+            self.exec_watcher = ExecWatcher(self.detector)
+            self.exec_watcher.start()
+        except OSError:
+            self.exec_watcher = None
 
     def _cpu_details(self):
         sockets = set(re.findall(r'^physical id\s*:\s*(.+)$', self.cpuinfo, re.M))
@@ -259,8 +292,19 @@ class Monitor:
             if result['nets'][name]['wifi']:
                 result['nets'][name].update(wifi_link(name))
         result['process_network_status'] = self.process_network.sample(rows,[(name,d['identity']) for name,d in result['nets'].items() if d['connected']])
-        # Runs where the data is collected, so a remote server checks full command lines before stripping them.
-        result['threats'] = self.detector.assess(rows,len(times))
+        state = root_state()
+        if state:
+            # The root service sees every process and owns the traps while it runs; local traps are removed.
+            self.detector.close()
+            for row in rows:
+                extra = state['processes'].get(f"{row['pid']}:{row['created']!r}")
+                if extra:
+                    row['exe'] = row['exe'] or extra['exe']
+                    row['disk'] = row['disk'] if row['disk'] is not None else extra['disk']
+            result['threats'], result['protection'] = state['threats'], 'root'
+        else:
+            result['threats'], result['protection'] = self.detector.assess(rows,len(times)), 'utente'
+        result['root_available'] = ROOT_TERMINATE.exists()
         self.last_net_ids = {name:d['identity'] for name,d in result['nets'].items()}
         self.net_hardware = {name:self.net_hardware[name] for name in result['nets']}
         gpus = gpu_devices()
@@ -298,6 +342,20 @@ class Monitor:
     def close(self):
         self.process_network.close()
         self.detector.close()  # removes the trap files
+        if self.exec_watcher:
+            self.exec_watcher.close()
+
+
+def terminate_as_root(targets):
+    """Other users' processes: one pkexec call (admin password) to the root helper, identity-checked there too."""
+    # shortcut: blocks the window while the polkit dialog is open; move to QProcess if that becomes a problem.
+    result = subprocess.run(['pkexec', str(ROOT_TERMINATE)]+[f"{pid}:{created!r}" for pid, created in targets],
+                            capture_output=True, text=True, timeout=300)
+    if result.returncode in (126, 127):
+        raise PermissionError('Autorizzazione di amministratore negata o annullata.')
+    if result.returncode != 0:
+        raise PermissionError(result.stderr.strip() or 'Il servizio root ha rifiutato la richiesta.')
+    return dict(line.split(' ', 1) for line in result.stdout.splitlines() if ' ' in line)
 
 
 def terminate_process(pid, created):
