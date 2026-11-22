@@ -4,7 +4,7 @@ os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import time
 import unittest
 from pathlib import Path
-from PySide6.QtWidgets import QApplication, QWidget, QScrollArea
+from PySide6.QtWidgets import QApplication, QWidget, QScrollArea, QLabel
 from PySide6.QtTest import QTest
 from PySide6.QtCore import Qt, QEventLoop, QTimer
 from app import Window, STYLE
@@ -72,7 +72,7 @@ class UITests(unittest.TestCase):
             self.assertIn('Fornitore di prova',window.info_text)
             Path('reference').mkdir(exist_ok=True)
             window.toggle_pause()
-            for width,height,expanded in ((1120,790,True),(900,660,False),(900,660,True)):
+            for width,height,expanded in ((1120,790,True),(900,660,False),(900,660,True),(1920,1080,True),(2560,1440,True),(1080,1920,True),(1120,790,True)):
                 window.resize(width,height)
                 self.app.processEvents()
                 if (window.navigation.width()>100) != expanded:
@@ -84,6 +84,16 @@ class UITests(unittest.TestCase):
                 self.assertLessEqual(scroll.widget().width(),scroll.viewport().width())
                 self.assertEqual(scroll.horizontalScrollBar().maximum(),0)
                 window.grab().save(f'reference/wifi-organized-{width}-{int(expanded)}.png')
+                if height>=1000:
+                    self.assertGreaterEqual(window.detail_labels[0].font().pixelSize(),14)
+                    self.assertGreaterEqual(window.value_labels[0].font().pixelSize(),27)
+                else:
+                    self.assertEqual(window.detail_labels[0].font().pixelSize(),11)
+                if width>=1920:
+                    for text,name in ((device['ipv6'],'Indirizzo IPv6:'),(device['hardware']['model'],'Modello:')):
+                        value=next(label for label in window.detail_labels if label.text()==text)
+                        title=next(label for label in value.parentWidget().findChildren(QLabel) if label.text()==name)
+                        self.assertEqual(value.y(),title.y())
                 for value in window.detail_labels:
                     self.assertGreater(value.width(),35)
                     if value.text() == device['ipv6']:
@@ -109,6 +119,40 @@ class UITests(unittest.TestCase):
                          'Tipo di connessione:','Indirizzo IPv4:','Indirizzo IPv6:',
                          'Indirizzo MAC:','Collegamento USB:'):
                 self.assertIn(name,window.info_text)
+        finally:
+            window.close()
+
+    def test_fullscreen_performance_and_connections_use_available_space(self):
+        window = Window()
+        window.show_page('performance')
+        window.show()
+        try:
+            wait(1200)
+            window.timer.stop(); window.sampler.wait(); self.app.processEvents()
+            window.toggle_pause()
+            for width,height in ((1920,1080),(2560,1440),(1080,1920),(1120,790)):
+                window.resize(width,height)
+                wait(100)
+                for kind in ('cpu','memory','disks','gpus','npus'):
+                    pair=next((key for key in window.resources if key[0]==kind),None)
+                    if not pair:
+                        continue
+                    window.select(*pair)
+                    wait(50)
+                    scroll=window.findChild(QScrollArea,'detail-scroll')
+                    self.assertLessEqual(scroll.widget().width(),scroll.viewport().width())
+                    self.assertGreaterEqual(window.detail_labels[0].font().pixelSize(),14 if height>=1000 else 11)
+                    for value in window.detail_labels:
+                        self.assertGreaterEqual(value.height(),value.heightForWidth(value.width()))
+                    if kind in ('cpu','memory'):
+                        window.grab().save(f'reference/fullscreen-after-{kind}-{width}.png')
+                window.select('connections','connections')
+                wait(50)
+                page=window.connection_page
+                wide=width>=1920
+                self.assertEqual(page.body.getItemPosition(page.body.indexOf(page.detail_scroll))[:2],(0,1) if wide else (1,0))
+                self.assertEqual(page.tree.font().pixelSize(),16 if width==2560 else 14 if height>=1000 else 12)
+                window.grab().save(f'reference/fullscreen-after-connections-{width}.png')
         finally:
             window.close()
 

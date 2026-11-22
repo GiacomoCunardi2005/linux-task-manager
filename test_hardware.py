@@ -13,6 +13,89 @@ import test_ui
 
 
 class HardwareTests(unittest.TestCase):
+    def test_local_port_calibration_requires_matching_machine_root_and_valid_data(self):
+        import json
+        from hardware import usb_port_labels,read
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder)/'usb-ports.json'
+            root = Path(folder)/'usb'
+            data = dict(machine=[read('/sys/class/dmi/id/sys_vendor'),read('/sys/class/dmi/id/product_name')],usb_root=str(root.resolve()),
+                ports=[dict(channels=['usb2-port3','usb3-port9'],name='Thunderbolt 4 · test',protocol='Thunderbolt 4')])
+            config.write_text(json.dumps(data))
+            self.assertEqual(usb_port_labels(config,root)[('usb2-port3','usb3-port9')]['protocol'],'Thunderbolt 4')
+            self.assertEqual(usb_port_labels(config,root/'other'),{})
+            data['machine']=['different','computer']
+            config.write_text(json.dumps(data))
+            self.assertEqual(usb_port_labels(config,root),{})
+            for content in ('not json','[]','{}',json.dumps(dict(data,machine=[read('/sys/class/dmi/id/sys_vendor'),read('/sys/class/dmi/id/product_name')],ports=[dict(channels=[1],name='bad',protocol='bad')]))):
+                config.write_text(content)
+                self.assertEqual(usb_port_labels(config,root),{})
+
+    def test_physical_ports_merge_firmware_channels_and_classify_internal_devices(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            usb,tb = root/'usb',root/'tb'
+            usb.mkdir(); tb.mkdir()
+            def device(path,**values):
+                path.mkdir(parents=True,exist_ok=True)
+                for key,value in dict(idVendor='1234',idProduct='5678',version='3.20',**values).items():
+                    (path/key).write_text(value)
+                (usb/path.name).symlink_to(path,target_is_directory=True)
+            hubs = [root/'pci0000:00'/f'controller{i}'/f'usb{i}' for i in (2,3,4)]
+            for hub in hubs:
+                device(hub,product='xHCI')
+            connectors = [root/'typec'/f'port{i}' for i in (0,1)]
+            for c in connectors:
+                c.mkdir(parents=True)
+            ports = []
+            for hub,index,location,connector in [(hubs[0],1,'0x80000001',connectors[0]),(hubs[1],1,'0x80000001',connectors[0]),
+                (hubs[0],2,'0x80000004',connectors[1]),(hubs[1],2,'0x80000004',connectors[1]),
+                (hubs[0],3,'0x80000002',None),(hubs[1],9,'0x80000002',None),
+                (hubs[1],3,'0x00000000',None),(hubs[2],1,'0x00000000',None)]:
+                bus = hub.name[3:]
+                port = hub/f'{bus}-0:1.0'/f'{hub.name}-port{index}'
+                port.mkdir(parents=True)
+                (port/'connect_type').write_text('hotplug')
+                (port/'location').write_text(location)
+                if connector:
+                    (port/'connector').symlink_to(connector,target_is_directory=True)
+                ports.append(port)
+            (ports[-1]/'peer').symlink_to(ports[-2],target_is_directory=True)
+            (ports[-2]/'peer').symlink_to(ports[-1],target_is_directory=True)
+            internal = hubs[1]/'3-7'
+            device(internal,product='Camera',removable='fixed')
+            dock = hubs[1]/'3-1'
+            device(dock,product='Dock',bDeviceClass='09')
+            device(dock/'3-1.1',product='Dock Ethernet',removable='fixed')
+            host = tb/'0-0'
+            host.mkdir()
+            (host/'generation').write_text('4')
+            tb_port = host/'usb4_port1'
+            tb_port.mkdir()
+            (tb_port/'link').write_text('none')
+            nodes = connection_devices(usb,tb)
+            physical = [n for n in nodes if n['kind']=='Porta esterna']
+            self.assertEqual(len(physical),4)
+            from connections import connection_summary
+            self.assertEqual(connection_summary(nodes),'4 porte esterne (firmware)')
+            by_name = {n['name']:n for n in nodes}
+            self.assertEqual(by_name['Camera']['group'],'internal')
+            self.assertEqual(by_name['Dock Ethernet']['group'],'external')
+            self.assertTrue(by_name['Dock']['parent'].startswith('port:'))
+            self.assertNotIn('Thunderbolt',by_name['USB-C · port0']['protocol'])
+            self.assertIn('Non esposta',dict(by_name['USB-C · port0']['details'])['Associazione USB4 / Thunderbolt'])
+            (tb_port/'connector').symlink_to(connectors[0],target_is_directory=True)
+            mapped = next(n for n in connection_devices(usb,tb) if n['kind']=='Porta esterna' and 'port0' in n['name'])
+            self.assertEqual(mapped['protocol'],'USB4 / Thunderbolt')
+            self.assertEqual(dict(mapped['details'])['Link usb4_port1'],'Nessun link attivo')
+            # Unknown and unused firmware ports must not inflate the chassis count.
+            (ports[-1]/'connect_type').write_text('unknown')
+            (ports[-2]/'connect_type').write_text('not used')
+            self.assertEqual(len([n for n in connection_devices(usb,tb) if n['kind']=='Porta esterna']),3)
+            (ports[4]/'location').unlink()
+            (ports[5]/'location').unlink()
+            self.assertIn('da abbinare',connection_summary(connection_devices(usb,tb)))
+
     def test_usb_discovery_reports_negotiated_speed_and_removal(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -210,6 +293,47 @@ class HotplugUITests(unittest.TestCase):
     def setUpClass(cls):
         test_ui.UITests.setUpClass()
         cls.app = test_ui.UITests.app
+
+    def test_internal_sections_start_collapsed_and_keep_state_during_hotplug(self):
+        from connections import ConnectionsPage
+        from PySide6.QtCore import QEvent
+        page = ConnectionsPage()
+        page.resize(1100,650)
+        page.show()
+        def close_page():
+            page.close()
+            page.deleteLater()
+            self.app.sendPostedEvents(None,QEvent.DeferredDelete)
+        self.addCleanup(close_page)
+        nodes = [dict(id='port',parent=None,name='USB-C · port0',kind='Porta esterna',group='external',protocol='USB-C',speed=None,details=[('Identificazione','Connettore firmware')]),
+            dict(id='root',parent=None,name='xHCI',kind='Root hub / controller',group='controllers',protocol='USB 3.20',speed=None,details=[]),
+            dict(id='camera',parent='root',name='Camera',kind='Dispositivo USB',group='internal',protocol='USB 2.00',speed='480 Mbit/s',details=[('Posizione','Interno')]),
+            dict(id='host',parent=None,name='Host',kind='Controller host',group='controllers',protocol='USB4',speed=None,details=[])]
+        page.receive(nodes)
+        self.assertEqual(page.items['camera'].parent(),page.groups['internal'])
+        self.assertTrue(page.groups['external'].isExpanded())
+        self.assertFalse(page.items['port'].isExpanded())
+        self.assertEqual(page.items['port'].text(2),'Nessun USB')
+        self.assertFalse(page.groups['internal'].isExpanded())
+        self.assertFalse(page.groups['controllers'].isExpanded())
+        self.assertIn('1 porta esterna',page.intro.text())
+        self.assertIn('associazione non disponibile',page.notice.text())
+        page.groups['internal'].setExpanded(True)
+        page.tree.setCurrentItem(page.items['camera'])
+        nodes[2]['speed'] = '12 Mbit/s'
+        page.receive(nodes)
+        self.assertTrue(page.groups['internal'].isExpanded())
+        self.assertEqual(page.tree.currentItem(),page.items['camera'])
+        self.assertIn('Camera',page.copy_text)
+        page.tree.setCurrentItem(page.groups['controllers'])
+        self.assertIn('Apri la sezione',page.detail.text())
+        page.receive([])
+        page.receive(nodes)
+        self.assertFalse(page.groups['internal'].isExpanded())
+        # Remote JSON changes tuples into lists; the same summary must still work.
+        import json
+        page.receive(json.loads(json.dumps(nodes)))
+        self.assertIn('1 porta esterna',page.intro.text())
 
     def test_connections_view_keeps_selection_expansion_and_clears_on_source_change(self):
         window = Window()

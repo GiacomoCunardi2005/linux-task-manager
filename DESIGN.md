@@ -10,7 +10,7 @@ User correction: keep only Processi and Prestazioni in the collapsible navigatio
 
 ## Processes view
 
-Extend the same Windows 11 dark world. Reference: reference/windows11-processes.jpg. Main pane uses search, 50px action toolbar, 50px two-line resource headers with live totals, 30px rows, flat dark background, burgundy heat cells for CPU/memory/disk/network. Name and status left; metrics right; Linux PID appended. Theme icons resolved through installed desktop files and XDG icon directories. Expandable same-user executable groups aggregate available usage, retain individual PID children, and do not support batch termination. Interpreter arguments distinguish unrelated scripts. Search and stable identity selection persist through live updates; stopping a task always names its identity and asks about unsaved data.
+Extend the same Windows 11 dark world. Reference: reference/windows11-processes.jpg. Main pane uses search, 50px action toolbar, 50px two-line resource headers with live totals, 30px rows, flat dark background, burgundy heat cells for CPU/memory/disk/network. Name and status left; metrics right; Linux PID appended. Theme icons resolved through installed desktop files and XDG icon directories. Expandable same-user executable groups aggregate available usage, retain individual PID children; ending a group stops every eligible child PID after one confirmation listing them (user request). Interpreter arguments distinguish unrelated scripts. Search and stable identity selection persist through live updates; stopping a task always names its identity and asks about unsaved data.
 
 Memory statistics include configured RAM speed, used slots, form factor, type and module capacities from cached udev SMBIOS data. Installed capacity is distinguished from Linux usable memory; commitment and slab use their actual Linux meanings. Missing firmware data stays unavailable, never inferred from the CPU or RAM model.
 
@@ -29,6 +29,8 @@ Preserve every network metric. Keep the chart first, then a compact full-width r
 ## Physical connections
 
 Add Collegamenti inside the existing Performance resource list, with a USB symbol instead of an invented sparkline. Its plain tree reads host/root hub → intermediate hub → peripheral; a separate USB4/Thunderbolt router tree avoids guessed cross-bus associations. Keep standard and negotiated link rate in separate columns, complete names/details in selection and tooltips, and a copy action. No utilization graph exists because no comparable real counter is exposed. Preserve expansion/selection during hotplug updates; reset when changing monitored computer.
+
+External chassis ports lead the connection view, including empty ports; companion USB channels merge only through firmware connector, peer or location metadata. Put fixed internal devices and controllers in separate groups collapsed by default, preserving the user's expansion choice on updates. Controller counts are never physical-port counts. Label USB4/Thunderbolt through an explicit sysfs connector association or a local physical calibration supported by the manufacturer's diagram. Calibration must match the machine and exact channels, travel as source metadata for remote monitoring, and clearly describe port capability rather than an active Thunderbolt link. Show unavailable mapping when neither source exists.
 
 Network charts and sidebar sparklines have a minimum upper scale of 1 Mbit/s (1,000,000 bit/s); autoscaling above that threshold still follows the 60-second history.
 

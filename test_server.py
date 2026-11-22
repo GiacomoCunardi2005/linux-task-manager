@@ -111,6 +111,11 @@ class ServerTests(unittest.TestCase):
             parent[path[-1]] = value
             with self.assertRaises(ValueError):
                 validate_packet(invalid)
+        for group in ('invented',False,[],None):
+            invalid = copy.deepcopy(packet)
+            invalid['data']['connections'] = [dict(id='root',parent=None,name='Test',kind='Root hub / controller',group=group,protocol='USB',speed=None,details=[])]
+            with self.assertRaises(ValueError):
+                validate_packet(invalid)
         legacy = copy.deepcopy(packet)
         legacy['data'].pop('connections',None)
         for device in legacy['data']['nets'].values():

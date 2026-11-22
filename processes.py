@@ -291,10 +291,17 @@ class ProcessPage(QWidget):
             return None
         return self.model.record(self.proxy.mapToSource(rows[0]))
 
+    def targets(self,row):
+        """Processes of the selection that may be stopped: the row itself, or every child of a group."""
+        if self.read_only or not row:
+            return []
+        return [p for p in row.get('children',[row]) if p['uid'] == os.getuid() and p['created'] is not None
+                and p['pid'] is not None and p['pid'] not in (0,1,os.getpid())]
+
     def selection_changed(self,*args):
         row = self.selected()
-        self.end_task.setToolTip('Monitoraggio remoto in sola lettura' if self.read_only else 'Espandi il gruppo e seleziona il singolo PID da terminare' if row and 'children' in row else 'Termina il processo selezionato')
-        self.end_task.setEnabled(bool(not self.read_only and row and row['uid'] == os.getuid() and row['created'] is not None and row['pid'] is not None and row['pid'] not in (0,1,os.getpid())))
+        self.end_task.setToolTip('Monitoraggio remoto in sola lettura' if self.read_only else 'Termina tutti i processi del gruppo' if row and 'children' in row else 'Termina il processo selezionato')
+        self.end_task.setEnabled(bool(self.targets(row)))
 
     def filter_changed(self,text):
         self.proxy.query = text.casefold()
@@ -341,17 +348,31 @@ class ProcessPage(QWidget):
 
     def end_selected(self):
         row = self.selected()
-        if self.read_only or not row or not self.end_task.isEnabled():
+        targets = self.targets(row)
+        if not targets or not self.end_task.isEnabled():
             return
-        answer = QMessageBox.question(self,'Termina attività',
-            f"Terminare {row['name']} (PID {row['pid']})?\nI dati non salvati potrebbero andare persi.",
+        if 'children' in row:
+            pids = ', '.join(str(p['pid']) for p in targets)
+            question = f"Terminare tutti i {len(targets)} processi di {row['name']} (PID {pids})?"
+        else:
+            question = f"Terminare {row['name']} (PID {row['pid']})?"
+        answer = QMessageBox.question(self,'Termina attività',question+'\nI dati non salvati potrebbero andare persi.',
             QMessageBox.Yes | QMessageBox.No,QMessageBox.No)
         if answer != QMessageBox.Yes:
             return
-        try:
-            terminate_process(row['pid'],row['created'])
-            self.status.setText(f"Richiesta di terminazione inviata a {row['name']} (PID {row['pid']}).")
-        except psutil.NoSuchProcess:
-            self.status.setText('Il processo è già terminato o il PID è cambiato.')
-        except (psutil.AccessDenied,PermissionError,ValueError) as exc:
-            QMessageBox.warning(self,'Impossibile terminare',str(exc))
+        sent, gone, errors = 0, 0, []
+        for target in targets:
+            try:
+                terminate_process(target['pid'],target['created'])
+                sent += 1
+            except psutil.NoSuchProcess:
+                gone += 1
+            except (psutil.AccessDenied,PermissionError,ValueError) as exc:
+                errors.append(f"PID {target['pid']}: {exc}")
+        if 'children' not in row:
+            self.status.setText(f"Richiesta di terminazione inviata a {row['name']} (PID {row['pid']})." if sent else
+                'Il processo è già terminato o il PID è cambiato.' if gone else self.status.text())
+        else:
+            self.status.setText(f"{row['name']}: terminazione inviata a {sent} processi"+(f", {gone} già terminati" if gone else '')+'.')
+        if errors:
+            QMessageBox.warning(self,'Impossibile terminare','\n'.join(errors))

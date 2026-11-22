@@ -109,6 +109,8 @@ def validate_packet(packet):
         for node in data['connections']:
             fields(node,'id name kind protocol',lambda v:isinstance(v,str))
             fields(node,'parent speed',text)
+            if 'group' in node:
+                fields(node,'group',lambda v:isinstance(v,str) and v in ('external','internal','controllers','unknown'))
             fields(node,'details',lambda v:isinstance(v,list) and all(isinstance(pair,list) and len(pair)==2 and all(isinstance(s,str) for s in pair) for pair in v))
             if node['id'] in seen or node['parent'] is not None and node['parent'] not in seen:
                 raise ValueError('Gerarchia dei collegamenti non valida.')

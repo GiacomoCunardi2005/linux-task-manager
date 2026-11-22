@@ -1,5 +1,7 @@
 """Read-only Linux device discovery and negotiated link metadata."""
 from pathlib import Path
+import json
+import os
 import re
 import subprocess
 
@@ -187,9 +189,90 @@ def wifi_link(interface):
         return parse_wifi_link('')
 
 
+def usb_port_labels(config=None,usb_root=Path('/sys/bus/usb/devices')):
+    """Local physical calibration must match the computer and the exact USB channels."""
+    config = config or Path(os.environ.get('XDG_CONFIG_HOME',Path.home()/'.config'))/'linux-task-manager'/'usb-ports.json'
+    try:
+        data = json.loads(read(config))
+        if data['machine'] != [read('/sys/class/dmi/id/sys_vendor'),read('/sys/class/dmi/id/product_name')]:
+            return {}
+        if data['usb_root'] != str(usb_root.resolve()):
+            return {}
+        labels = {}
+        for port in data['ports']:
+            if not isinstance(port['channels'],list) or not port['channels'] or not all(isinstance(c,str) and re.fullmatch(r'usb\d+-port\d+',c) for c in port['channels']):
+                return {}
+            if not all(isinstance(port[k],str) and 0<len(port[k])<=200 for k in ('name','protocol')):
+                return {}
+            labels[tuple(sorted(port['channels']))] = port
+        return labels
+    except (ValueError,TypeError,KeyError):
+        return {}
+
+
+def external_usb_ports(usb_root,tb_root):
+    """Merge root-hub channels only using firmware connector, peer or location data."""
+    groups = {}
+    routes = {}
+    for hub in sorted(usb_root.glob('usb*')):
+        for port in sorted(hub.glob('*:*/usb*-port*')):
+            if read(port/'connect_type') != 'hotplug':
+                continue
+            connector = (port/'connector').resolve() if (port/'connector').exists() else None
+            location = read(port/'location')
+            peer = (port/'peer').resolve() if (port/'peer').exists() else None
+            if connector:
+                key = str(connector)
+            elif peer:
+                key = min(str(port.resolve()),str(peer))
+            elif re.fullmatch(r'0x[0-9a-fA-F]+',location) and int(location,16):
+                # Firmware locations identify chassis connectors across companion controllers.
+                domain = next((str(p) for p in hub.resolve().parents if re.fullmatch(r'pci[0-9a-fA-F]{4}:[0-9a-fA-F]{2}',p.name)),str(usb_root.resolve()))
+                key = domain+'/location-'+location.lower()
+            else:
+                # shortcut: unpaired channels stay distinct; upgrade when firmware exposes a connector or peer.
+                key = str(port.resolve())
+            group = groups.setdefault(key,dict(connector=connector,ports=[]))
+            group['ports'].append(port)
+            bus = hub.name.removeprefix('usb')
+            routes[str(hub.resolve()/f'{bus}-{port.name.rsplit("port",1)[-1]}')] = 'port:'+key
+    nodes = []
+    labels = usb_port_labels(usb_root=usb_root)
+    tb_ports = [p for host in tb_root.glob('*-0') for p in host.glob('usb4_port*')]
+    for key,group in groups.items():
+        connector,ports = group['connector'],group['ports']
+        name = 'USB-C · '+connector.name if connector else 'Porta USB · '+ports[0].name
+        details = [('Tipo','Porta esterna'),('Canali USB',' / '.join(p.name for p in ports)),
+            ('Identificazione','Connettore firmware' if connector else 'Porte companion' if any((p/'peer').exists() for p in ports) else 'Posizione firmware' if read(ports[0]/'location') not in ('','0x00000000') else 'Canale non abbinato: conteggio fisico non verificabile')]
+        details.append(('Stato USB','Dispositivo collegato' if any(read(Path(route)/'idVendor') for route,port_id in routes.items() if port_id=='port:'+key) else 'Nessun dispositivo USB rilevato'))
+        protocol = 'USB-C' if connector else 'USB'
+        if connector:
+            matches = [p for p in tb_ports if (p/'connector').exists() and (p/'connector').resolve()==connector]
+            details.append(('Connettore',connector.name))
+            if matches:
+                protocol = 'USB4 / Thunderbolt'
+                name += ' · USB4 / Thunderbolt'
+                details.append(('Associazione USB4 / Thunderbolt','Confermata dal kernel'))
+                details.extend(('Link '+p.name,{'tbt':'Thunderbolt attivo','usb4':'USB4 attivo','none':'Nessun link attivo'}.get(read(p/'link'),'Non disponibile')) for p in matches)
+            else:
+                details.append(('Associazione USB4 / Thunderbolt','Non esposta dal firmware; non identificabile per questa presa'))
+        label = labels.get(tuple(sorted(p.name for p in ports)))
+        if label:
+            name,protocol = label['name'],label['protocol']
+            details = [(k,v) for k,v in details if k!='Associazione USB4 / Thunderbolt']
+            details.extend([('Identificazione fisica','Verifica incrociata locale con Nikon e hub USB'),
+                ('Standard della presa',protocol+' (schema del produttore, non link attivo)')])
+        elif labels and connector:
+            name = 'Porta USB · '+connector.name+' (tipo fisico da verificare)'
+            protocol = 'USB'
+        nodes.append(dict(id='port:'+key,parent=None,name=name,kind='Porta esterna',group='external',protocol=protocol,speed=None,details=details))
+    return nodes,routes
+
+
 def connection_devices(usb_root=Path('/sys/bus/usb/devices'),tb_root=Path('/sys/bus/thunderbolt/devices')):
     """Keep USB and Thunderbolt trees separate unless sysfs proves a relationship."""
-    result = []
+    result,routes = external_usb_ports(usb_root,tb_root)
+    scopes = {}
     usb = {p.resolve():p for p in usb_root.glob('*') if re.fullmatch(r'[0-9a-fA-F]{4}',read(p/'idVendor'))}
     for path,p in sorted(usb.items(),key=lambda item:(len(item[0].parts),str(item[0]))):
         root = re.fullmatch(r'usb\d+',p.name) is not None
@@ -198,12 +281,26 @@ def connection_devices(usb_root=Path('/sys/bus/usb/devices'),tb_root=Path('/sys/
         speed = usb_speed(p)
         vendor,product = read(p/'idVendor'),read(p/'idProduct')
         kind = 'Root hub / controller' if root else 'Hub USB' if read(p/'bDeviceClass').lower() == '09' else 'Dispositivo USB'
+        if root:
+            scope = 'controllers'
+        elif scopes.get(parent)=='internal':
+            scope = 'internal'
+        elif scopes.get(parent)=='external' or str(path) in routes:
+            scope = 'external'
+        elif read(p/'removable')=='fixed' or read(p/'port'/'connect_type')=='hardwired':
+            scope = 'internal'
+        else:
+            scope = 'external' if read(p/'removable')=='removable' else 'unknown'
+        scopes[str(path)] = scope
         details = [('Tipo',kind),('Produttore',read(p/'manufacturer') or 'Non disponibile'),
             ('ID USB',vendor+':'+product),('Porta / bus',p.name),('Versione USB dichiarata',version or 'Non disponibile'),
             ('Velocità negoziata',speed if not root and speed else 'Non disponibile' if not root else 'Non applicabile al root hub'),
             ('Controller',next((a.parent.name for a in (path,*path.parents) if re.fullmatch(r'usb\d+',a.name)), 'Non disponibile'))]
+        details.append(('Posizione',{'controllers':'Controller interno (non è una presa fisica)','internal':'Interno','external':'Esterno','unknown':'Non disponibile'}[scope]))
+        if scope == 'external' and str(path) in routes:
+            parent = routes[str(path)]
         result.append(dict(id=str(path),parent=parent,name=read(p/'product') or p.name,kind=kind,
-            protocol='USB '+version if version else 'USB',speed=None if root else speed,details=details))
+            group=scope,protocol='USB '+version if version else 'USB',speed=None if root else speed,details=details))
     routers = {p.resolve():p for p in tb_root.glob('*') if re.fullmatch(r'\d+-[0-9a-fA-F]+',p.name) and (p/'generation').exists()}
     for path,p in sorted(routers.items(),key=lambda item:(len(item[0].parts),str(item[0]))):
         generation = read(p/'generation')
@@ -214,6 +311,11 @@ def connection_devices(usb_root=Path('/sys/bus/usb/devices'),tb_root=Path('/sys/
         details = [('Tipo','Controller host' if host else 'Router / dock'),('Protocollo rilevato',protocol),
             ('Produttore',read(p/'vendor_name') or 'Non disponibile'),('Porta / dominio',p.name),
             ('Autorizzazione',{'0':'Da autorizzare','1':'Autorizzato'}.get(read(p/'authorized'),'Non disponibile'))]
+        if host and read('/sys/class/dmi/id/sys_vendor')=='LENOVO' and read('/sys/class/dmi/id/product_name').startswith('21MA') and read('/sys/class/dmi/id/product_version')=='ThinkPad E16 Gen 2':
+            details.extend([('Posizione fisica Thunderbolt 4','USB-C vicina alla USB-A, sul lato con HDMI'),
+                ('Altra presa USB-C','Vicina alla cerniera (USB 20 Gbit/s)'),
+                ('Fonte posizione','https://psref.lenovo.com/syspool/Sys/PDF/ThinkPad/ThinkPad_E16_Gen_2_Intel/ThinkPad_E16_Gen_2_Intel_Spec.pdf'),
+                ('Abbinamento canale / presa','Non verificato: i canali logici del kernel possono non distinguere le due prese fisiche')])
         for direction in ('rx','tx'):
             speed,lanes = read(p/(direction+'_speed')),number(p/(direction+'_lanes'))
             match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)\s+Gb/s',speed)
@@ -224,6 +326,5 @@ def connection_devices(usb_root=Path('/sys/bus/usb/devices'),tb_root=Path('/sys/
                 ('Totale '+direction.upper(),totals[direction] or 'Non disponibile')])
         speed = totals['rx'] if totals['rx'] == totals['tx'] else 'RX '+(totals['rx'] or 'N/D')+' / TX '+(totals['tx'] or 'N/D')
         result.append(dict(id=str(path),parent=parent,name=read(p/'device_name') or p.name,
-            kind='Controller host' if host else 'Router / dock',protocol=protocol,speed=speed,details=details))
-    result.sort(key=lambda node:not node['protocol'].startswith(('USB4','Thunderbolt')))
+            kind='Controller host' if host else 'Router / dock',group='controllers' if host else 'external',protocol=protocol,speed=speed,details=details))
     return result

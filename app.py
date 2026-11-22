@@ -7,7 +7,7 @@ import sys
 import time
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QRectF, QEvent
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QIcon, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QIcon, QPixmap, QFont, QFontMetrics
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QToolButton, QScrollArea, QFrame, QGridLayout, QMenu, QSizeGrip, QProgressBar, QStackedWidget,
@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, 
 from metrics import Monitor, read, size, percent, uptime
 from processes import ProcessPage
 from remote import RemoteMonitor, PORT
-from connections import ConnectionsPage
+from connections import ConnectionsPage, connection_summary
 
 COLORS = {'cpu':'#42a7bf', 'memory':'#8b8fd7', 'disks':'#9bc86b', 'nets':'#d48bbb', 'gpus':'#aa92d0', 'npus':'#d4a5db', 'connections':'#7daeb8'}
 ICON_PATHS = {
@@ -135,6 +135,14 @@ class Resource(QPushButton):
         for child in (marker, self.title, self.subtitle):
             child.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAccessibleName(title)
+
+    def set_roomy(self,roomy):
+        if getattr(self,'roomy',None) == roomy:
+            return
+        self.roomy = roomy
+        self.setFixedHeight(82 if roomy else 70)
+        self.title.setStyleSheet(f'color:#eeeeee; font-size:{16 if roomy else 15}px; background:transparent;')
+        self.subtitle.setStyleSheet(f'color:#eeeeee; font-size:{13 if roomy else 11}px; background:transparent;')
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -281,6 +289,7 @@ class Window(QWidget):
         content.setSpacing(0)
         area.addLayout(content,1)
         resource_scroll = QScrollArea()
+        self.resource_scroll = resource_scroll
         resource_scroll.setWidgetResizable(True)
         resource_scroll.setFixedWidth(210)
         resource_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -332,9 +341,10 @@ class Window(QWidget):
         self.charts.addWidget(self.graphs[0],0,0)
         self.detail_layout.addWidget(self.chartbox,1)
         axis = QHBoxLayout()
-        axis.addWidget(label('60 secondi',10,'#cccccc'))
+        self.axis_labels = [label('60 secondi',10,'#cccccc'),label('0',10,'#cccccc')]
+        axis.addWidget(self.axis_labels[0])
         axis.addStretch()
-        axis.addWidget(label('0',10,'#cccccc'))
+        axis.addWidget(self.axis_labels[1])
         self.detail_layout.addLayout(axis)
         self.composition_label = label('Composizione memoria',11,'#cccccc')
         self.detail_layout.addWidget(self.composition_label)
@@ -520,6 +530,7 @@ class Window(QWidget):
                 button.clicked.connect(lambda checked=False,k=kind,n=key: self.select(k,n))
                 self.resources[(kind,key)] = button
             button = self.resources[(kind,key)]
+            button.set_roomy(self.width()>=1800 or self.height()>=1000)
             if button.full_title != title:
                 button.full_title = title
                 button.setAccessibleName(title)
@@ -602,6 +613,7 @@ class Window(QWidget):
         cols = 1 if kind == 'disks' else (4 if count > 8 else (2 if count > 1 else 1))
         for i in range(count):
             graph = Graph(COLORS[kind])
+            graph.setFont(self.chart_label.font())
             graph.setMinimumSize(50,160 if count == 1 else 45)
             graph.setToolTip(f'Processore logico {i}' if count > 1 else 'Ultimi 60 secondi')
             self.charts.addWidget(graph,i//cols,i%cols)
@@ -621,7 +633,9 @@ class Window(QWidget):
         for (kind,key),button in self.resources.items():
             if kind == 'connections':
                 nodes = data.get('connections')
-                button.subtitle.setText('USB / Thunderbolt\n'+(f'{len(nodes)} elementi' if nodes is not None else 'Aggiorna il server'))
+                summary = connection_summary(nodes).removesuffix(' (firmware)').replace('Conteggio prese non disponibile','Prese non rilevate') if nodes is not None else 'Aggiorna il server'
+                button.subtitle.setText('USB / Thunderbolt\n'+summary)
+                button.setToolTip(connection_summary(nodes) if nodes is not None else 'Aggiorna il server')
                 continue
             d = data[kind] if kind in ('cpu','memory') else data[kind].get(key)
             if d is None:
@@ -798,15 +812,44 @@ class Window(QWidget):
 
     def set_stats(self,values,details,detail_columns=None):
         self.stats_content = values,details,detail_columns
-        wide = self.stats.width() >= 560
+        width = self.stats.width()
+        density = 2 if width >= 1700 else 1 if width >= 1050 or (self.height()>=1000 and width>=500) else 0
+        wide = width >= (840 if density else 560)
+        stacked = bool(detail_columns) or bool(density and width<840)
+        detail_px, caption_px, value_px, row_gap, section_gap = (
+            (11,11,20,4,20),(14,13,27,8,28),(16,14,32,10,32))[density]
+        small_px = detail_px+3
+        font = QFont(self.stats.font())
+        font.setPixelSize(detail_px)
+        metrics = QFontMetrics(font)
+        full_rows = set()
+        metadata_columns = 2 if detail_columns and wide else 1
+        column_width = (width-section_gap*(metadata_columns-1))/metadata_columns
+        layouts = detail_columns or [[('',details)]]
+        for sections in layouts:
+            for title,items in sections:
+                label_width = max((metrics.horizontalAdvance(name) for name,_ in items),default=0)
+                for name,value in items:
+                    if name in ('Modello:','Indirizzo IPv6:') and metrics.horizontalAdvance(value)+label_width+(20 if density else 12)>column_width:
+                        full_rows.add((title,name))
+        if getattr(self,'performance_density',None) != density:
+            self.performance_density = density
+            for widget,pixels,color in [(self.heading,28+4*density,'#eeeeee'),(self.device,14+2*density,'#eeeeee'),
+                    (self.chart_label,caption_px,'#cccccc'),(self.scale,caption_px,'#cccccc'),
+                    (self.composition_label,caption_px,'#cccccc'),(self.notice,10+2*density,'#bdbdbd')]+[(widget,10+2*density,'#cccccc') for widget in self.axis_labels]:
+                widget.setStyleSheet(f'color:{color}; font-size:{pixels}px; background:transparent;')
+            for graph in self.graphs:
+                graph.setFont(font)
+            self.detail_layout.setSpacing(5+3*density)
         signature = (tuple(k for k,_ in values), tuple(k for k,_ in details),
-            tuple(tuple(title for title,_ in column) for column in detail_columns) if detail_columns else None,wide)
+            tuple(tuple(title for title,_ in column) for column in detail_columns) if detail_columns else None,
+            wide,density,stacked,tuple(sorted(full_rows)))
         if getattr(self,'stats_signature',None) == signature:
             for widget,(_,value) in zip(self.value_labels,values):
                 small = len(value) >= 17 or value == 'Non disponibile'
                 was_small = len(widget.text()) >= 17 or widget.text() == 'Non disponibile'
                 if small != was_small:
-                    widget.setStyleSheet(f'color:#eeeeee; font-size:{14 if small else 20}px; background:transparent;')
+                    widget.setStyleSheet(f'color:#eeeeee; font-size:{small_px if small else value_px}px; background:transparent;')
                 widget.setText(value)
             for widget,(_,value) in zip(self.detail_labels,details):
                 widget.setText(value)
@@ -822,14 +865,14 @@ class Window(QWidget):
         left = QWidget()
         grid = QGridLayout(left)
         grid.setContentsMargins(0,0,0,0)
-        grid.setSpacing(12)
+        grid.setSpacing(12+4*density)
         for i,(name,value) in enumerate(values):
             cell = QWidget()
             column = QVBoxLayout(cell)
             column.setContentsMargins(0,0,0,0)
             column.setSpacing(3)
-            column.addWidget(label(name,11,'#cccccc'))
-            value_label = label(value,20 if len(value)<17 and value != 'Non disponibile' else 14)
+            column.addWidget(label(name,caption_px,'#cccccc'))
+            value_label = label(value,value_px if len(value)<17 and value != 'Non disponibile' else small_px)
             self.value_labels.append(value_label)
             column.addWidget(value_label)
             if detail_columns:
@@ -843,41 +886,41 @@ class Window(QWidget):
         grid.setRowStretch((len(values)+1)//2,1)
         if detail_columns:
             grid.setColumnStretch(len(values),1)
-        self.stats_layout.addWidget(left,0,0,1,2 if detail_columns else 1)
+        self.stats_layout.addWidget(left,0,0,1,2 if stacked else 1)
         right = QWidget()
         columns = QGridLayout(right)
         columns.setContentsMargins(0,0,0,0)
-        columns.setHorizontalSpacing(24)
-        columns.setVerticalSpacing(20)
+        columns.setHorizontalSpacing(section_gap)
+        columns.setVerticalSpacing(section_gap)
         layouts = detail_columns or [[('',details)]]
         for column_index,sections in enumerate(layouts):
             container = QWidget()
             groups = QVBoxLayout(container)
             groups.setContentsMargins(0,0,0,0)
-            groups.setSpacing(20)
+            groups.setSpacing(section_gap)
             for title,items in sections:
                 section = QWidget()
                 section.setObjectName('detail-section')
                 group = QVBoxLayout(section)
                 group.setContentsMargins(0,0,0,0)
-                group.setSpacing(8)
+                group.setSpacing(8+4*density)
                 if title:
-                    heading = label(title,12)
+                    heading = label(title,detail_px+1)
                     heading.setObjectName('detail-heading')
-                    heading.setStyleSheet('font-size:12px; font-weight:600; color:#eeeeee;')
+                    heading.setStyleSheet(f'font-size:{detail_px+1}px; font-weight:600; color:#eeeeee;')
                     group.addWidget(heading)
                 rows = QGridLayout()
                 rows.setContentsMargins(0,0,0,0)
-                rows.setHorizontalSpacing(12)
-                rows.setVerticalSpacing(4)
+                rows.setHorizontalSpacing(20 if density else 12)
+                rows.setVerticalSpacing(row_gap)
                 rows.setColumnStretch(1,1)
                 row = 0
                 for name,value in items:
-                    full_width = (title == 'Indirizzi' and name == 'Indirizzo IPv6:') or (title == 'Identità hardware' and name == 'Modello:')
-                    name_label = label(name,11,'#cccccc')
-                    name_label.setWordWrap(True)
+                    full_width = (title,name) in full_rows
+                    name_label = label(name,detail_px,'#cccccc')
+                    name_label.setWordWrap(not density)
                     rows.addWidget(name_label,row,0,1,2 if full_width else 1,Qt.AlignTop)
-                    val = label(value,11)
+                    val = label(value,detail_px)
                     val.setWordWrap(True)
                     policy = val.sizePolicy()
                     policy.setHorizontalPolicy(QSizePolicy.Ignored)
@@ -897,9 +940,11 @@ class Window(QWidget):
             columns.addWidget(container,0 if wide or not detail_columns else column_index,
                 column_index if wide or not detail_columns else 0)
             columns.setColumnStretch(column_index if wide else 0,1)
-        self.stats_layout.addWidget(right,1 if detail_columns else 0,0 if detail_columns else 1,1,2 if detail_columns else 1)
+        self.stats_layout.addWidget(right,1 if stacked else 0,0 if stacked else 1,1,2 if stacked else 1)
+        self.stats_layout.setHorizontalSpacing(section_gap)
+        self.stats_layout.setVerticalSpacing(section_gap)
         self.stats_layout.setColumnStretch(0,1)
-        self.stats_layout.setColumnStretch(1,0 if detail_columns else 1)
+        self.stats_layout.setColumnStretch(1,0 if stacked else 1)
 
     def copy_info(self):
         QApplication.clipboard().setText(getattr(self,'info_text','In attesa dei contatori'))
@@ -912,6 +957,13 @@ class Window(QWidget):
         super().resizeEvent(event)
         if hasattr(self,'navigation') and self.width() < 1000 and self.navigation.width() > 100:
             self.toggle_navigation()
+        if hasattr(self,'resource_scroll'):
+            roomy = self.width()>=1800 or self.height()>=1000
+            self.resource_scroll.setFixedWidth(240 if roomy else 210)
+            for resource in self.resources.values():
+                resource.set_roomy(roomy)
+        if hasattr(self,'stats_reflow'):
+            self.stats_reflow.start(0)
 
     def closeEvent(self,event):
         self.timer.stop()

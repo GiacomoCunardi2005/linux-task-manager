@@ -78,7 +78,15 @@ class ProcessTests(unittest.TestCase):
             self.assertEqual(root.data(),'codex (2)')
             page.table.setExpanded(root,True)
             page.table.selectionModel().select(root,QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
-            self.assertFalse(page.end_task.isEnabled())
+            self.assertTrue(page.end_task.isEnabled())
+            with patch('processes.QMessageBox.question',return_value=QMessageBox.No), patch('processes.terminate_process') as terminate:
+                page.end_selected()
+                terminate.assert_not_called()
+            with patch('processes.QMessageBox.question',return_value=QMessageBox.Yes) as ask, patch('processes.terminate_process',side_effect=[None,psutil.NoSuchProcess(987652)]) as terminate:
+                page.end_selected()
+                self.assertIn('987651, 987652',ask.call_args.args[2])
+                self.assertEqual([c.args for c in terminate.call_args_list],[(987651,1.),(987652,1.)])
+                self.assertIn('1 processi, 1 già terminati',page.status.text())
             child = page.proxy.index(1,0,root)
             page.table.selectionModel().select(child,QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
             self.assertEqual(page.selected()['pid'],987652)
