@@ -94,6 +94,18 @@ All’avvio vengono creati **file trappola** (honeyfile o canary file) con nomi 
 - Alla chiusura dell’app o del servizio le trappole vengono eliminate. Dopo un arresto anomalo vengono rimosse al successivo avvio grazie al registro in `~/.cache/linux-task-manager/traps/` (servizio root: `/var/lib/linux-task-manager/traps/`); si cancella solo un file normale del proprio utente che inizia con l’intestazione della trappola.
 - Possono far scattare le trappole: antivirus, programmi di **backup** o sincronizzazione della home, comandi come `grep -r ~` e programmi di pulizia. Con il servizio root, se il processo che le apre ha un nome presente nella lista delle eccezioni (per esempio `deja-dup`), l’accesso non viene segnalato. Per disattivare le trappole aggiungere la riga `trappole` alla lista delle eccezioni.
 
+### Estensioni degli agenti AI (Claude Code, Codex)
+
+Hook, skill, plugin e server MCP degli agenti di programmazione sono codice che gira con i tuoi permessi, a volte prima che il modello o tu ve ne accorgiate. Ogni 5 minuti (rileggendo solo i file cambiati) vengono controllati:
+
+- **hook** di `~/.claude/settings*.json`, dei progetti (`.claude/settings*.json`) e dei plugin installati di Claude e Codex: rischio alto se leggono credenziali e usano la rete, eseguono programmi da cartelle temporanee o contengono shell remote o miner;
+- **skill e comandi**: i comandi `` !`…` `` che Claude Code esegue *prima* di passare il testo al modello (contesto dinamico), con le stesse regole; `allowed-tools: Bash(*)` nell’intestazione di una skill (qualsiasi comando senza conferma);
+- **server MCP** di `~/.claude.json`, dei progetti (`.mcp.json`, `.codex/config.toml`), di Codex e dei plugin: comandi pericolosi, pacchetti avviati con `npx`/`uvx`/`bunx`/`pnpm dlx` **senza versione fissata** o con `@latest` (a ogni avvio viene eseguita l’ultima versione pubblicata, anche se compromessa), collegamenti `http` non cifrati;
+- **impostazioni** che tolgono le protezioni: Codex con `sandbox_mode = "danger-full-access"` o `approval_policy = "never"`, Claude Code con `bypassPermissions`;
+- **file dei repository** noti a Claude o Codex: `.env` che imposta `CODEX_HOME` (tecnica della CVE-2025-61260); `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` o `.cursorrules` nella cartella dei download.
+
+Viene salvata un’impronta di ogni hook, server MCP e comando dinamico (`~/.cache/linux-task-manager/agents.json`, servizio root: `/var/lib/linux-task-manager/agents.json`). Se uno compare o cambia dopo il primo controllo, l’avviso «nuovi o modificati dall’ultimo controllo» resta per 24 ore: difende dal *rug pull*, cioè un’estensione approvata quando era innocua e cambiata dopo. Un aggiornamento dei plugin fatto da te produce lo stesso avviso. Per escludere un elemento aggiungere alla lista delle eccezioni l’etichetta mostrata (per esempio `Server MCP «playwright» (~/.claude.json)`); la riga `agenti` disattiva tutto il controllo. Non vengono letti i *contenuti* restituiti dai server MCP in esecuzione (descrizioni degli strumenti), quindi l’avvelenamento delle descrizioni non è rilevabile da qui.
+
 ### Processi di breve durata
 
 Il kernel avvisa a ogni avvio di programma (proc connector), quindi anche i processi che durano meno del campionamento di 1 secondo vengono controllati: l’app legge `/proc` subito dopo l’avvio e un processo terminato in un millisecondo con un eseguibile in `/dev/shm` viene comunque segnalato. Su questo kernel funziona anche senza root; per i processi di altri utenti senza servizio root l’eseguibile non è leggibile e valgono i controlli su nome e riga di comando. Sono controllati anche i file di avvio di sistema (`/etc/cron.d`, `/etc/crontab`, unità systemd in `/etc/systemd/system`, `/etc/xdg/autostart`, `/etc/profile.d`) e `/etc/ld.so.preload`, che carica una libreria in ogni programma ed è una tecnica tipica dei rootkit.
@@ -105,7 +117,7 @@ Limiti: senza servizio root, per i processi di altri utenti eseguibile e conness
 ## Verifica
 
 ```bash
-.venv/bin/python -m unittest -v test_metrics test_ui test_processes test_hardware test_process_network test_detection test_rootservice
+.venv/bin/python -m unittest -v test_metrics test_ui test_processes test_hardware test_process_network test_detection test_rootservice test_agents
 ```
 
 Test della contabilizzazione CPU, reset dei contatori, coerenza dei dati Linux e interazione delle viste Qt (risorse, pausa, processori logici, copia, finestra compatta). La cartella locale `reference/` non viene pubblicata: può contenere schermate con dati del computer e riferimenti esterni. I test UI producono schermate reali in `reference/linux-*.png` usando Qt offscreen.

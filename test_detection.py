@@ -25,7 +25,7 @@ class DetectionTests(unittest.TestCase):
             (self.root/name).mkdir()
         self.cron = ''
         self.detector = Detector(home=self.root/'home',proc=self.root/'proc',usb_root=self.root/'usb',
-            config=self.root/'ignore.txt',read_crontab=lambda: self.cron,traps=False,preload=self.root/'preload',
+            config=self.root/'ignore.txt',read_crontab=lambda: self.cron,traps=False,preload=self.root/'preload',agents=False,
             system_startup=(str(self.root/'etc'/'cron.d'/'*'),))
         patcher = patch('detection.psutil.net_connections',return_value=[])
         self.connections = patcher.start()

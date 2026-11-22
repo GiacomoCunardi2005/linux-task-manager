@@ -15,6 +15,9 @@ import threading
 import time
 import psutil
 import pwd
+
+sys.path.insert(0,str(Path(__file__).resolve().parent))  # python -I (exec watcher, root service) skips the script folder
+from agents import AgentScanner  # noqa: E402
 import select
 
 SYSTEM_DIRS = ('/usr/','/bin/','/sbin/','/lib','/opt/','/snap/','/app/','/nix/store/','/var/lib/flatpak/')
@@ -419,7 +422,9 @@ class ExecWatcher(threading.Thread):
         first = self.child.stdout.readline().strip()
         if first != 'ok':
             self.close()
-            raise OSError(first or 'osservatore degli avvii terminato')
+            if first.startswith('errore'):
+                raise OSError(first)  # the kernel refused the subscription
+            raise RuntimeError('osservatore degli avvii terminato all’avvio')  # a bug, not a missing feature
 
     def run(self):
         for line in self.child.stdout:
@@ -500,8 +505,10 @@ def crontab(user=None):
 
 class Detector:
     def __init__(self,home=None,proc=Path('/proc'),usb_root=Path('/sys/bus/usb/devices'),config=None,read_crontab=crontab,traps=None,
-                 preload=Path('/etc/ld.so.preload'),system_startup=SYSTEM_STARTUP):
+                 preload=Path('/etc/ld.so.preload'),system_startup=SYSTEM_STARTUP,agents=None,agent_baseline=None):
         self.home = Path(home or Path.home())
+        self.agents = AgentScanner(self.home,agent_baseline or self.home/'.cache'/'linux-task-manager'/'agents.json',
+                                   downloads=user_dir(self.home,'DOWNLOAD'),commands=COMMANDS) if agents is None else agents
         self.system_startup = system_startup
         self.preload = Path(preload)
         self.exec_lock, self.exec_pending, self.short_lived = threading.Lock(), {}, []
@@ -627,7 +634,10 @@ class Detector:
         self.static = {k:v for k,v in self.static.items() if k in alive}
         self.cpu = {k:v for k,v in self.cpu.items() if k in alive}
         system = []
-        for part in (lambda: self.startup_findings(now,ignored),self.keyboard_findings):
+        parts = [lambda: self.startup_findings(now,ignored),self.keyboard_findings]
+        if self.agents:
+            parts.append(lambda: self.agents.scan(now,ignored))
+        for part in parts:
             try:
                 system += part()
             except OSError as exc:

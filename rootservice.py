@@ -56,14 +56,15 @@ def run():
     signal.signal(signal.SIGTERM,lambda *_: stop.append(1))
     signal.signal(signal.SIGINT,lambda *_: stop.append(1))
     traps = Traps(places=default_places(user.pw_dir),registry=TRAP_REGISTRY,owner=(user.pw_uid,user.pw_gid))
-    detector = Detector(home=user.pw_dir,config=IGNORE,traps=traps,read_crontab=lambda: crontab(user.pw_name)+crontab('root'))
+    detector = Detector(home=user.pw_dir,config=IGNORE,traps=traps,read_crontab=lambda: crontab(user.pw_name)+crontab('root'),
+                        agent_baseline=Path('/var/lib/linux-task-manager/agents.json'))
     features = dict(fanotify=False,exec=False)
     try:
         watcher = ExecWatcher(detector)
         traps.lookup = watcher.recent_description
         watcher.start()
         features['exec'] = True
-    except OSError as exc:
+    except (OSError,RuntimeError) as exc:
         watcher = None
         print(f'Processi brevi non osservabili: {exc}',file=sys.stderr)
     sampler = Sampler()

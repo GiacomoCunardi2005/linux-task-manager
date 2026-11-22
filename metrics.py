@@ -151,7 +151,7 @@ class Monitor:
             if self.detector.traps:
                 self.detector.traps.lookup = self.exec_watcher.recent_description
             self.exec_watcher.start()
-        except OSError:
+        except (OSError,RuntimeError):
             self.exec_watcher = None
 
     def _cpu_details(self):

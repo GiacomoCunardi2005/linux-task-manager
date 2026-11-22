@@ -30,7 +30,7 @@ home="$(getent passwd "$user" | cut -d: -f6)"
 [[ -d "$home" ]] || { echo "Cartella home di $user non trovata." >&2; exit 1; }
 
 install -d -m 0755 -o root -g root "$dest" /etc/linux-task-manager
-install -m 0644 -o root -g root "$src/rootservice.py" "$src/detection.py" "$dest/"
+install -m 0644 -o root -g root "$src/rootservice.py" "$src/detection.py" "$src/agents.py" "$dest/"
 cat > "$dest/terminate" <<'SH'
 #!/bin/sh
 exec /usr/bin/python3 -I -B /opt/linux-task-manager-root/rootservice.py terminate "$@"
