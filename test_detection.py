@@ -146,6 +146,25 @@ class DetectionTests(unittest.TestCase):
         system = self.detector.assess([],4,0.)['system']
         self.assertTrue(any('breve durata' in s['reason'] and 'miner' in s['reason'] for s in system),system)
 
+    def test_exec_watcher_names_a_reader_that_already_exited(self):
+        from detection import ExecWatcher
+        try:
+            watcher = ExecWatcher(self.detector)
+        except OSError as exc:
+            self.skipTest(f'proc connector non disponibile: {exc}')
+        watcher.start()
+        self.addCleanup(watcher.close)
+        trap = self.root/'trap.txt'
+        trap.write_text('x')
+        child = subprocess.run(['sh','-c','cat "$1" >/dev/null; echo $$','sh',str(trap)],capture_output=True,text=True)
+        time.sleep(.5)
+        cat = [desc for pid,(_,desc) in list(watcher.recent.items()) if desc[0] == 'cat']
+        self.assertTrue(cat,'exec di cat non registrato')
+        self.assertIn(f'utente {psutil.Process().username()}',cat[-1][1])
+        self.assertIn('/cat',cat[-1][1])
+        self.assertIsNone(Traps.describe(int(child.stdout)))  # the shell is gone: /proc no longer helps
+        self.assertIsNone(watcher.recent_description(2**22+7))
+
     def test_proc_connector_parser(self):
         import struct
         def message(what,pid,tgid):
@@ -249,6 +268,13 @@ class TrapTests(unittest.TestCase):
         self.assertIn('/sleep',text)
         with self.assertRaises(OSError):
             os.fstat(event_fd)  # the event's descriptor was closed
+
+    def test_exited_opener_is_named_from_recent_execs(self):
+        self.traps.lookup = {424242:('cat','cat, utente jack, /usr/bin/cat')}.get
+        with self.traps.fan_lock:
+            self.traps.fan_seen[str(self.first)] = {424242:(time.monotonic(),None)}  # fanotify PID, /proc already gone
+        self.first.read_bytes()
+        self.assertIn('da PID 424242 (cat, utente jack, /usr/bin/cat)',self.traps.poll()[-1]['reason'])
 
     def test_describe_reads_name_user_and_executable(self):
         name,text = Traps.describe(os.getpid())

@@ -94,6 +94,7 @@ class Traps:
         self.registry = Path(registry or cache/'linux-task-manager'/'traps')
         self.paths, self.hits, self.fd, self.fan = {}, [], None, None
         self.fan_lock, self.fan_seen, self.fan_thread = threading.Lock(), {}, None
+        self.lookup = lambda pid: None  # ExecWatcher.recent_description when available
 
     def arm(self):
         libc = ctypes.CDLL(None,use_errno=True)
@@ -220,7 +221,7 @@ class Traps:
                 finally:
                     os.close(event_fd)
                 if pid > 0 and pid != os.getpid():
-                    description = self.describe(pid)
+                    description = self.describe(pid) or self.lookup(pid)
                     with self.fan_lock:
                         seen = self.fan_seen.setdefault(path,{})
                         seen[pid] = (time.monotonic(),description or (seen.get(pid) or (0,None))[1])
@@ -256,7 +257,7 @@ class Traps:
             if actions:
                 seen = fan_seen.get(str(path),{})
                 pids = sorted(set(seen) | set(self.openers(path)))
-                described = [seen.get(pid) or self.describe(pid) or ('già terminato','già terminato') for pid in pids]
+                described = [seen.get(pid) or self.describe(pid) or self.lookup(pid) or ('già terminato','già terminato') for pid in pids]
                 names = [name for name,_ in described]
                 who = (' da '+', '.join(f'PID {pid} ({text})' for pid,(_,text) in zip(pids,described)) if pids else
                        ' (processo non identificabile: già chiuso, o senza il servizio root)')
@@ -313,6 +314,9 @@ class ExecWatcher(threading.Thread):
     def __init__(self,detector):
         super().__init__(daemon=True)
         self.detector = detector
+        # pid -> (time, (name, description)) of recent execs: a reader that exits before /proc can be read is
+        # still named, because exec is reported before the program opens anything.
+        self.recent = {}
         self.sock = socket.socket(socket.AF_NETLINK,socket.SOCK_DGRAM,11)  # NETLINK_CONNECTOR
         self.sock.bind((0,1))  # CN_IDX_PROC multicast group
         message = struct.pack('IHHII',16+20+4,3,0,0,0)+struct.pack('IIIIHH',1,1,0,0,4,0)+struct.pack('I',1)  # PROC_CN_MCAST_LISTEN
@@ -328,16 +332,32 @@ class ExecWatcher(threading.Thread):
                 if pid == tgid:
                     row = self.snapshot(tgid)
                     if row:
+                        self.remember(row)
                         self.detector.exec_seen(row)
+
+    def remember(self,row):
+        try:
+            user = pwd.getpwuid(row['uid']).pw_name
+        except (KeyError,TypeError):
+            user = str(row['uid'])
+        self.recent[row['pid']] = (time.monotonic(),(row['name'],f"{row['name']}, utente {user}"+(f", {row['exe']}" if row['exe'] else '')))
+        while len(self.recent) > 4096:
+            self.recent.pop(next(iter(self.recent)))
+
+    def recent_description(self,pid):
+        entry = self.recent.get(pid)
+        return entry[1] if entry and time.monotonic()-entry[0] < 300 else None
 
     @staticmethod
     def snapshot(pid):
         """Raw /proc reads, fastest first: the process may exit within milliseconds of exec()."""
         base = f'/proc/{pid}/'
+        uid = exe = None
         try:
+            uid = os.stat(base).st_uid  # /proc/PID is owned by the process's user
             exe = os.readlink(base+'exe')
         except OSError:
-            exe = None  # other users' processes without root
+            pass  # gone, or another user's executable without root
         try:
             with open(base+'cmdline','rb') as handle:
                 cmdline = [arg.decode(errors='replace') for arg in handle.read().split(b'\0') if arg]
@@ -348,7 +368,7 @@ class ExecWatcher(threading.Thread):
             return None
         name = stat_line[stat_line.find('(')+1:stat_line.rfind(')')]
         ppid = int(stat_line[stat_line.rfind(')')+2:].split()[1])
-        return dict(pid=pid,created=created,name=name,exe=exe and exe.removesuffix(' (deleted)'),cmdline=cmdline,ppid=ppid)
+        return dict(pid=pid,created=created,name=name,exe=exe and exe.removesuffix(' (deleted)'),cmdline=cmdline,ppid=ppid,uid=uid)
 
     def close(self):
         self.sock.close()

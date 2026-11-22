@@ -83,6 +83,7 @@ def run():
     features = dict(fanotify=False,exec=False)
     try:
         watcher = ExecWatcher(detector)
+        traps.lookup = watcher.recent_description
         watcher.start()
         features['exec'] = True
     except OSError as exc:

@@ -147,6 +147,8 @@ class Monitor:
         try:
             # The proc connector accepts unprivileged listeners on this kernel; without it, 1 s sampling still applies.
             self.exec_watcher = ExecWatcher(self.detector)
+            if self.detector.traps:
+                self.detector.traps.lookup = self.exec_watcher.recent_description
             self.exec_watcher.start()
         except OSError:
             self.exec_watcher = None
