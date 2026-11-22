@@ -1,0 +1,12 @@
+# Eccezioni per gli avvisi delle destinazioni di rete, una per riga.
+# Un dominio include i suoi sottodomini; si possono indicare anche IP esatti.
+# La corrispondenza di un dominio dipende dalle risposte DNS osservate di recente.
+# Un servizio noto non garantisce che ogni connessione sia innocua.
+spotify.com
+youtube.com
+microsoft.com
+apple.com
+github.com
+wikipedia.org
+claude.ai
+chatgpt.com

@@ -8,6 +8,7 @@
 No payload beyond DNS headers and names is read; nothing is decrypted.
 """
 import ctypes
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,45 @@ from netbehavior import NetworkAnalyzer
 PACKET_HOST, PACKET_OUTGOING = 0, 4
 SO_ATTACH_FILTER, SO_TIMESTAMPNS = 26, 35
 LOCAL = ('127.','::1','fe80:','169.254.')
+DNS_ASSOCIATION_SECONDS = 300
+
+
+def network_exceptions(path):
+    """Read exact IPs and DNS suffixes; invalid lines never suppress findings."""
+    try:
+        lines = Path(path).read_text(encoding='utf-8').splitlines()
+    except (OSError,UnicodeError):
+        return set(),set()
+    domains, addresses = set(),set()
+    for line in lines:
+        value = line.split('#',1)[0].strip().lower().rstrip('.')
+        if not value:
+            continue
+        try:
+            addresses.add(str(ipaddress.ip_address(value)))
+            continue
+        except ValueError:
+            pass
+        if len(value) <= 253 and '.' in value and all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',label) for label in value.split('.')):
+            domains.add(value)
+    return domains,addresses
+
+
+def excluded_destination(item,analyzer,exceptions,now):
+    if item.get('kind') != 'destinazione' or not item.get('key'):
+        return False
+    domains,addresses = exceptions
+    raw = item['key'].rsplit(':',1)[0].strip('[]')
+    try:
+        ip = str(ipaddress.ip_address(raw))
+    except ValueError:
+        return False
+    if ip in addresses:
+        return True
+    name = analyzer.ip_domain.get(ip,'').lower().rstrip('.')
+    seen = analyzer.dns_seen_at.get(ip)
+    return bool(name and seen is not None and 0 <= now-seen <= DNS_ASSOCIATION_SECONDS and
+                any(name == domain or name.endswith('.'+domain) for domain in domains))
 
 
 def bpf_program():
@@ -147,8 +187,9 @@ def local(address):
 
 
 class NetWatch:
-    def __init__(self,baseline_path,uid=None,include_loopback=False):
+    def __init__(self,baseline_path,uid=None,include_loopback=False,ignore_path=None):
         self.path, self.uid, self.loopback = Path(baseline_path), uid, include_loopback
+        self.ignore_path = ignore_path
         try:
             baseline = json.loads(self.path.read_text())
         except (OSError,ValueError):
@@ -300,6 +341,9 @@ class NetWatch:
             with self.lock:
                 self.starts = {k:v for k,v in self.starts.items() if now-v < 6*3600}
                 results = self.analyzer.analyze(now)
+                if self.ignore_path:
+                    exceptions = network_exceptions(self.ignore_path)
+                    results = [item for item in results if not excluded_destination(item,self.analyzer,exceptions,now)]
             self.attribute(results)
             self.results = results[:50]
         if now-self.times['save'] >= 300:

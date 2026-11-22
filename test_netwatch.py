@@ -5,8 +5,46 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import unittest
-from netwatch import bpf_program, parse_dns
+from unittest.mock import patch
+from netwatch import bpf_program, parse_dns, network_exceptions, excluded_destination, NetWatch
+from netbehavior import NetworkAnalyzer
+
+
+class NetworkExceptionsTests(unittest.TestCase):
+    def test_domains_ips_and_recent_dns_are_matched_precisely(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'network-ignore.txt'
+            path.write_text('# commento\nSpotify.com\n2001:db8::1\n*.invalid.com\n')
+            exceptions = network_exceptions(path)
+            self.assertEqual(exceptions,({'spotify.com'},{'2001:db8::1'}))
+            analyzer = NetworkAnalyzer(now=100)
+            analyzer.dns_event(100,'track.spotify.com',1,0,True,['192.0.2.1'])
+            destination = dict(kind='destinazione',key='192.0.2.1:443')
+            self.assertTrue(excluded_destination(destination,analyzer,exceptions,101))
+            self.assertFalse(excluded_destination(destination,analyzer,exceptions,401))
+            analyzer.dns_event(102,'spotify.com.attacker.example',1,0,True,['192.0.2.1'])
+            self.assertFalse(excluded_destination(destination,analyzer,exceptions,103))
+            analyzer.dns_event(104,'spostify.com',1,0,True,['192.0.2.1'])
+            self.assertFalse(excluded_destination(destination,analyzer,exceptions,105))
+            self.assertTrue(excluded_destination(dict(kind='destinazione',key='[2001:db8::1]:443'),analyzer,exceptions,105))
+            self.assertFalse(excluded_destination(dict(kind='spike',key='[2001:db8::1]:443'),analyzer,exceptions,105))
+            path.unlink()
+            self.assertEqual(network_exceptions(path),(set(),set()))
+
+    def test_poll_reloads_exceptions_without_hiding_other_results(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'ignore.txt'
+            path.write_text('spotify.com\n')
+            watch = NetWatch(Path(folder)/'baseline.json',ignore_path=path)
+            watch.analyzer.dns_event(100,'a.spotify.com',1,0,True,['192.0.2.1'])
+            items = [dict(kind='destinazione',key='192.0.2.1:443',score=90),dict(kind='spike',score=80)]
+            with patch.object(watch,'flows',return_value=[]), patch.object(watch,'user_idle',return_value=None), \
+                 patch.object(watch,'attribute'), patch.object(watch.analyzer,'analyze',return_value=items):
+                self.assertEqual(watch.poll(101),[items[1]])
+                path.write_text('')
+                self.assertEqual(watch.poll(132),items)
 
 SCENARIO = r'''
 import json, random, socket, struct, subprocess, sys, tempfile, threading, time

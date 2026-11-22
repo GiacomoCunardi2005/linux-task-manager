@@ -43,6 +43,7 @@ chmod 0644 /etc/linux-task-manager/service.json
     '# Eccezioni del servizio root, una per riga: percorso eseguibile, nome processo,' \
     '# file di avvio (percorso completo), "crontab utente" o "trappole". Modificabile solo da root.' \
     > /etc/linux-task-manager/ignore.txt
+[[ -e /etc/linux-task-manager/network-ignore.txt ]] || install -m 0644 -o root -g root "$src/network-ignore.txt" /etc/linux-task-manager/network-ignore.txt
 
 cat > "$unit" <<EOF
 [Unit]

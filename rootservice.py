@@ -22,6 +22,7 @@ from netwatch import NetWatch
 CONFIG = Path('/etc/linux-task-manager/service.json')
 # Root-owned ignore list: a user-writable one would let user-level malware switch the checks off.
 IGNORE = Path('/etc/linux-task-manager/ignore.txt')
+NETWORK_IGNORE = Path('/etc/linux-task-manager/network-ignore.txt')
 STATE = Path('/run/linux-task-manager/state.json')
 TRAP_REGISTRY = Path('/var/lib/linux-task-manager/traps')
 
@@ -84,7 +85,7 @@ def run():
         watcher = None
         print(f'Processi brevi non osservabili: {exc}',file=sys.stderr)
     sampler = Sampler()
-    watch = NetWatch(Path('/var/lib/linux-task-manager/network.json'),uid=user.pw_uid).start()
+    watch = NetWatch(Path('/var/lib/linux-task-manager/network.json'),uid=user.pw_uid,ignore_path=NETWORK_IGNORE).start()
     try:
         while not stop:
             started = time.monotonic()
