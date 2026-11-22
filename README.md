@@ -74,6 +74,8 @@ La somiglianza visiva è una ricostruzione, non una corrispondenza pixel per pix
 
 La pagina Processi segnala in **Stato** i processi «Sospetto» (rischio alto) o «Da verificare» (rischio medio); il tooltip spiega il motivo. Scrivere «sospetto» nella ricerca mostra solo quelli. La riga in fondo riassume processi e avvisi di sistema; il suo tooltip elenca gli avvisi di sistema. Sono segnali euristici sui dati già raccolti, **non un antivirus**: non analizzano il contenuto dei file e non chiudono nulla da soli.
 
+Il pulsante **Anomalie dei processi** mostra un riepilogo dei singoli processi segnalati, con PID, utente, livello e motivi; il numero sul pulsante indica quanti sono. La finestra mostra i dati del momento in cui viene aperta. Gli avvisi di sistema restano nel riepilogo in fondo alla pagina e le anomalie di rete nella loro finestra dedicata.
+
 Controlli sui processi:
 - nome da thread del kernel (`kworker`, `kthreadd`…) in un processo che non discende da kthreadd: funziona anche per i processi di altri utenti, perché usa solo nome e PID padre;
 - eseguibile cancellato dopo l’avvio, fuori dalle cartelle di sistema (gli eseguibili sostituiti da un aggiornamento in `/usr` sono normali e ignorati);

@@ -11,7 +11,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtTest import QAbstractItemModelTester
 from PySide6.QtCore import Qt, QItemSelectionModel
 from PySide6.QtWidgets import QApplication, QMessageBox
-from processes import ProcessModel, process_groups
+from processes import ProcessModel, ProcessAnomaliesDialog, process_groups
 from metrics import Monitor, terminate_process
 import test_ui
 from test_ui import wait
@@ -113,6 +113,13 @@ class ProcessTests(unittest.TestCase):
             threats = dict(processes=[dict(pid=987662,created=1.,severity='alta',reasons=['Parametri tipici di un miner'])],
                            system=[dict(severity='media',reason='Nuova tastiera USB collegata')])
             page.receive(dict(window.snapshot,process_rows=rows,threats=threats))
+            self.assertTrue(page.process_anomalies.isEnabled())
+            self.assertEqual(page.process_anomalies.text(),'Anomalie dei processi (1)')
+            dialog = ProcessAnomaliesDialog(page,page.model)
+            item = dialog.tree.topLevelItem(0)
+            self.assertEqual([item.text(i) for i in range(4)],['Sospetto','miner','987662','test'])
+            self.assertEqual(item.child(0).text(0),'Parametri tipici di un miner')
+            dialog.close()
             statuses = {page.proxy.index(i,0).data():page.proxy.index(i,1).data() for i in range(page.proxy.rowCount())}
             self.assertEqual(statuses['miner (2)'],'Sospetto')
             self.assertNotEqual(statuses['quiet'],'Sospetto')
@@ -131,6 +138,11 @@ class ProcessTests(unittest.TestCase):
             legacy.pop('threats')
             page.receive(legacy)
             self.assertIn('Controlli di sicurezza non disponibili',page.status.text())
+            self.assertFalse(page.process_anomalies.isEnabled())
+            page.receive(dict(window.snapshot,process_rows=rows,threats=dict(processes=[],system=[])))
+            dialog = ProcessAnomaliesDialog(page,page.model)
+            self.assertIn('Nessun processo segnalato',dialog.tree.topLevelItem(0).text(1))
+            dialog.close()
         finally:
             window.close()
 

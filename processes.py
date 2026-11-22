@@ -258,6 +258,10 @@ class ProcessPage(QWidget):
         self.pause = QPushButton('Sospendi')
         self.pause.clicked.connect(self.toggle_pause)
         actions.addWidget(self.pause)
+        self.process_anomalies = QPushButton('Anomalie dei processi')
+        self.process_anomalies.setEnabled(False)
+        self.process_anomalies.clicked.connect(self.show_process_anomalies)
+        actions.addWidget(self.process_anomalies)
         self.network_button = QPushButton('Anomalie di rete')
         self.network_button.setEnabled(False)
         self.network_button.setToolTip('Richiede il servizio root: sudo ./install-root-service.sh')
@@ -372,15 +376,21 @@ class ProcessPage(QWidget):
     def show_network(self):
         NetworkDialog(self,self.model.network).exec()
 
+    def show_process_anomalies(self):
+        ProcessAnomaliesDialog(self,self.model).exec()
+
     def update_status(self):
         model = self.model
+        flagged = len(model.threats)
+        self.process_anomalies.setEnabled(model.threats_available)
+        self.process_anomalies.setText(f'Anomalie dei processi ({flagged})' if flagged else 'Anomalie dei processi')
+        self.process_anomalies.setToolTip('Processi segnalati e motivi' if model.threats_available else 'Controlli di sicurezza non disponibili')
         network = model.network
         self.network_button.setEnabled(network is not None)
         if network is not None:
             worth = sum(1 for a in network['anomalies'] if a['score'] >= 40)
             self.network_button.setText(f'Anomalie di rete ({worth})' if worth else 'Anomalie di rete')
             self.network_button.setToolTip('Comunicazioni ordinate per punteggio di anomalia comportamentale')
-        flagged = len(model.threats)
         system = model.system_threats
         if not model.threats_available:
             security = ' · Controlli di sicurezza non disponibili'
@@ -455,6 +465,48 @@ class ProcessPage(QWidget):
             self.status.setText(f"{row['name']}: terminazione inviata a {sent} processi"+(f", {gone} già terminati" if gone else '')+'.')
         if errors:
             QMessageBox.warning(self,'Impossibile terminare','\n'.join(errors))
+
+
+class ProcessAnomaliesDialog(QDialog):
+    """Show the evidence for each flagged process, including individual members of groups."""
+    def __init__(self,parent,model):
+        super().__init__(parent)
+        self.setWindowTitle('Anomalie dei processi')
+        self.setStyleSheet('QDialog { background:#202020; }')
+        self.resize(900,560)
+        layout = QVBoxLayout(self)
+        note = QLabel('Processi segnalati dai controlli comportamentali. I motivi sono indizi da verificare, non una diagnosi antivirus. Il riepilogo mostra il campione al momento dell’apertura.')
+        note.setWordWrap(True)
+        note.setStyleSheet('color:#bdbdbd; font-size:11px; padding:4px;')
+        layout.addWidget(note)
+        self.tree = QTreeWidget()
+        self.tree.setAccessibleName('Processi segnalati e motivi')
+        self.tree.setHeaderLabels(['Stato','Processo','PID','Utente'])
+        self.tree.setColumnWidth(0,150)
+        self.tree.setColumnWidth(1,330)
+        self.tree.setColumnWidth(2,100)
+        self.tree.setWordWrap(True)
+        rows = {(row['pid'],row['created']):row for group in model.rows for row in group.get('children',[group])}
+        findings = sorted(model.threats.items(),key=lambda pair: (pair[1]['severity'] != 'alta',pair[0][0]))
+        for identity,finding in findings:
+            process = rows.get(identity,{})
+            high = finding['severity'] == 'alta'
+            item = QTreeWidgetItem(['Sospetto' if high else 'Da verificare',process.get('name','Non disponibile'),str(finding['pid']),process.get('user') or 'N/D'])
+            item.setForeground(0,QColor('#ff99a4' if high else '#f5c26b'))
+            for reason in finding['reasons']:
+                child = QTreeWidgetItem([reason])
+                child.setToolTip(0,reason)
+                item.addChild(child)
+            self.tree.addTopLevelItem(item)
+            for index in range(item.childCount()):
+                item.child(index).setFirstColumnSpanned(True)
+            item.setExpanded(True)
+        if not findings:
+            self.tree.addTopLevelItem(QTreeWidgetItem(['','Nessun processo segnalato nel campione attuale']))
+        layout.addWidget(self.tree)
+        close = QPushButton('Chiudi')
+        close.clicked.connect(self.accept)
+        layout.addWidget(close,0,Qt.AlignRight)
 
 
 NETWORK_KINDS = dict(destinazione='Destinazione',dga='Domini generati (DGA)',tunnel='Tunnel DNS',spike='Picco del dispositivo')
