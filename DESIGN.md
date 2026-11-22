@@ -18,9 +18,9 @@ Device resources synchronize from each completed sample. Removed/replaced device
 
 Process network cells show Mbps from NetHogs cumulative TCP/UDP byte deltas. No privileged GUI, automatic privilege changes, or zero values substituted for a failed capture backend. Expanded groups and the selected process identity survive refresh.
 
-## Remote source
+## Tray and protection
 
-A title-bar connection button opens a compact IP/host, port and access-key form. The source label remains visible on both pages, names the remote host and marks read-only mode or connection failure. The connection form offers a return to the local PC. Source changes clear selected PID, all charts and old resource labels; late signals from an earlier sampler are ignored. Existing graph/page layouts remain shared by local and remote monitoring.
+Remote monitoring was removed at the user's request. The app autostarts at login hidden in the notification area; closing the window hides it, the tray menu offers Apri and Esci. The tray icon uses the CPU accent normally, amber for Da verificare and pink for Sospetto, and each new finding raises one notification. The Processi footer names the protection level (root service or user only).
 
 ## Network Performance details
 
@@ -30,8 +30,8 @@ Preserve every network metric. Keep the chart first, then a compact full-width r
 
 Add Collegamenti inside the existing Performance resource list, with a USB symbol instead of an invented sparkline. Its plain tree reads host/root hub → intermediate hub → peripheral; a separate USB4/Thunderbolt router tree avoids guessed cross-bus associations. Keep standard and negotiated link rate in separate columns, complete names/details in selection and tooltips, and a copy action. No utilization graph exists because no comparable real counter is exposed. Preserve expansion/selection during hotplug updates; reset when changing monitored computer.
 
-External chassis ports lead the connection view, including empty ports; companion USB channels merge only through firmware connector, peer or location metadata. Put fixed internal devices and controllers in separate groups collapsed by default, preserving the user's expansion choice on updates. Controller counts are never physical-port counts. Label USB4/Thunderbolt through an explicit sysfs connector association or a local physical calibration supported by the manufacturer's diagram. Calibration must match the machine and exact channels, travel as source metadata for remote monitoring, and clearly describe port capability rather than an active Thunderbolt link. Show unavailable mapping when neither source exists.
+External chassis ports lead the connection view, including empty ports; companion USB channels merge only through firmware connector, peer or location metadata. Put fixed internal devices and controllers in separate groups collapsed by default, preserving the user's expansion choice on updates. Controller counts are never physical-port counts. Label USB4/Thunderbolt through an explicit sysfs connector association or a local physical calibration supported by the manufacturer's diagram. Calibration must match the machine and exact channels, and clearly describe port capability rather than an active Thunderbolt link. Show unavailable mapping when neither source exists.
 
 Network charts and sidebar sparklines have a minimum upper scale of 1 Mbit/s (1,000,000 bit/s); autoscaling above that threshold still follows the 60-second history.
 
-Network identity shows the hardware model at the chart heading and groups manufacturer, model and IDs in Identità hardware. Scheda di rete explicitly calls the Linux name Interfaccia, then shows driver, bus, location and MTU. Keep radio settings and addresses separate; USB route remains its own group. Descriptor manufacturer and registered ID vendor are distinct when they disagree. Model names and IPv6 values receive full-row space when needed. Existing one/two-column reflow and complete Copy information remain shared by local and remote sources.
+Network identity shows the hardware model at the chart heading and groups manufacturer, model and IDs in Identità hardware. Scheda di rete explicitly calls the Linux name Interfaccia, then shows driver, bus, location and MTU. Keep radio settings and addresses separate; USB route remains its own group. Descriptor manufacturer and registered ID vendor are distinct when they disagree. Model names and IPv6 values receive full-row space when needed. Existing one/two-column reflow and complete Copy information remain.

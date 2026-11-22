@@ -134,6 +134,47 @@ class ProcessTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_tray_announces_new_alerts_once_and_close_hides(self):
+        class FakeTray:
+            def __init__(self):
+                self.messages, self.tooltip = [], ''
+            def showMessage(self,title,text,*args):
+                self.messages.append((title,text))
+            def setIcon(self,icon):
+                pass
+            def setToolTip(self,text):
+                self.tooltip = text
+        window = Window()
+        window.show()
+        try:
+            wait(1400)
+            window.timer.stop()
+            window.sampler.wait()
+            window.tray = tray = FakeTray()
+            rows = [dict(pid=987671,created=1.,name='dropper',status='sleeping',user='test',uid=os.getuid(),cpu=1.,memory=1,disk=0,network=0)]
+            threats = dict(processes=[dict(pid=987671,created=1.,severity='alta',reasons=['Eseguibile in memoria condivisa'])],
+                           system=[dict(severity='media',reason='Nuova tastiera USB collegata')],traps=[])
+            data = dict(window.snapshot,process_rows=rows,threats=threats)
+            window.receive(data)
+            self.assertEqual(len(tray.messages),1)
+            self.assertEqual(tray.messages[0][0],'Comportamento sospetto')
+            self.assertIn('dropper (PID 987671)',tray.messages[0][1])
+            self.assertIn('altri 1',tray.messages[0][1])
+            self.assertIn('2 avvisi',tray.tooltip)
+            window.receive(data)
+            self.assertEqual(len(tray.messages),1)  # unchanged findings are not repeated
+            window.receive(dict(data,threats=dict(threats,system=[])))
+            window.receive(data)
+            self.assertEqual(len(tray.messages),2)  # a finding that came back is announced again
+            window.timer.start(1000)
+            window.close()
+            self.assertFalse(window.isVisible())
+            self.assertTrue(window.timer.isActive())  # still monitoring in the tray
+            self.assertIn('area di notifica',tray.messages[-1][1])
+        finally:
+            window.quitting = True
+            window.close()
+
     def test_live_rows_and_cpu_warmup(self):
         monitor = Monitor()
         self.addCleanup(monitor.close)

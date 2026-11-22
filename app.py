@@ -3,13 +3,14 @@
 import argparse
 from collections import defaultdict, deque
 from pathlib import Path
+import signal
 import sys
 import time
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QRectF, QEvent
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QIcon, QPixmap, QFont, QFontMetrics
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
+from PySide6.QtWidgets import (QApplication, QSystemTrayIcon, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QToolButton, QScrollArea, QFrame, QGridLayout, QMenu, QSizeGrip, QProgressBar, QStackedWidget,
     QMessageBox, QSizePolicy, QLayout)
 from metrics import Monitor, read, size, percent, uptime
@@ -215,6 +216,7 @@ class Window(QWidget):
         self.selection = ('cpu','cpu')
         self.paused = False
         self.logical = False
+        self.tray, self.quitting, self.told_tray, self.seen_alerts = None, False, False, set()
         self.setWindowTitle('Gestione attività — Processi Linux')
         self.setWindowIcon(icon('performance',COLORS['cpu']))
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
@@ -457,6 +459,7 @@ class Window(QWidget):
         self.snapshot = data
         self.sync_resources(data)
         self.process_page.receive(data)
+        self.notify(data)
         now = time.monotonic()
         for kind in ('cpu','memory'):
             self.histories[(kind,kind)].append((now,data[kind]['value']))
@@ -869,7 +872,52 @@ class Window(QWidget):
         if hasattr(self,'stats_reflow'):
             self.stats_reflow.start(0)
 
+    def bring_to_front(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit(self):
+        self.quitting = True
+        self.close()
+        QApplication.quit()
+
+    @staticmethod
+    def alerts(data):
+        """{key: (severity, text)} for every current finding; the key changes when the reasons change."""
+        threats = data.get('threats') or {}
+        names = {row['pid']:row['name'] for row in data.get('process_rows',[])}
+        found = {('p',f['pid'],f['created'],tuple(f['reasons'])):(f['severity'],f"{names.get(f['pid'],'Processo')} (PID {f['pid']}): "+'; '.join(f['reasons']))
+                 for f in threats.get('processes',[])}
+        found.update({('s',f['reason']):(f['severity'],f['reason']) for f in threats.get('system',[])})
+        return found
+
+    def notify(self,data):
+        current = self.alerts(data)
+        new = [value for key,value in current.items() if key not in self.seen_alerts]
+        self.seen_alerts = set(current)  # a finding that disappears and comes back is announced again
+        tray = self.tray
+        if not tray:
+            return
+        high = any(severity == 'alta' for severity,_ in current.values())
+        tray.setIcon(icon('performance','#ff99a4' if high else '#f5c26b' if current else COLORS['cpu']))
+        tray.setToolTip('Gestione attività · '+(f'{len(current)} avvisi di sicurezza' if current else 'nessun avviso'))
+        if new:
+            new.sort(key=lambda item: item[0] != 'alta')
+            text = new[0][1]+(f'\n…e altri {len(new)-1} avvisi' if len(new) > 1 else '')
+            tray.showMessage('Comportamento sospetto' if new[0][0] == 'alta' else 'Da verificare',text,
+                QSystemTrayIcon.Critical if new[0][0] == 'alta' else QSystemTrayIcon.Warning,15000)
+
     def closeEvent(self,event):
+        tray = self.tray
+        if tray and not self.quitting:
+            # Closing the window keeps monitoring in the tray; Esci in the tray menu really quits.
+            if self.isVisible() and not self.told_tray:
+                tray.showMessage('Gestione attività','Continua a sorvegliare dall’area di notifica. Per uscire usa Esci nel menu dell’icona.',QSystemTrayIcon.Information,6000)
+                self.told_tray = True
+            self.hide()
+            event.ignore()
+            return
         self.timer.stop()
         self.stats_reflow.stop()
         self.sampler.wait()
@@ -922,9 +970,23 @@ QMenu::item:selected { background:#404040; }
 '''
 
 
+class Tray(QSystemTrayIcon):
+    def __init__(self,window):
+        super().__init__(icon('performance',COLORS['cpu']),window)
+        self.menu = QMenu()
+        self.menu.addAction('Apri Gestione attività',window.bring_to_front)
+        self.menu.addSeparator()
+        self.menu.addAction('Esci',window.quit)
+        self.setContextMenu(self.menu)
+        self.setToolTip('Gestione attività')
+        self.activated.connect(lambda reason: window.bring_to_front() if reason == QSystemTrayIcon.Trigger else None)
+        self.messageClicked.connect(window.bring_to_front)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--screenshot',type=Path,help='Save an actual live render after 4 samples and exit')
+    parser.add_argument('--tray',action='store_true',help='Start hidden in the notification area (used at login)')
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
     app.setApplicationName('linux-task-manager')
@@ -933,7 +995,20 @@ def main():
     app.setStyle('Fusion')
     app.setStyleSheet(STYLE)
     window = Window()
-    window.show()
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        app.setQuitOnLastWindowClosed(False)
+        window.tray = Tray(window)
+        window.tray.show()
+    if not (args.tray and window.tray):
+        window.show()  # without a tray the window must stay reachable
+    # Logout sends SIGTERM: quit cleanly so trap files are removed. Qt blocks Python signal handlers,
+    # so a timer gives the interpreter a chance to run them. The handler may interrupt any slot (e.g. poll(),
+    # which would restart the sampler after close), so quitting is queued as its own event.
+    for number in (signal.SIGTERM,signal.SIGINT):
+        signal.signal(number,lambda *_: QTimer.singleShot(0,window.quit))
+    window.signal_tick = QTimer(window)
+    window.signal_tick.timeout.connect(lambda: None)
+    window.signal_tick.start(500)
     if args.screenshot:
         def capture():
             window.grab().save(str(args.screenshot))
