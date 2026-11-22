@@ -8,6 +8,7 @@ from collections import Counter
 import time
 import psutil
 from process_network import ProcessNetwork
+from detection import Detector
 from hardware import read, number, disk_devices, gpu_devices, npu_devices, wifi_link, link_details, network_identity, connection_devices, network_hardware
 
 
@@ -115,6 +116,7 @@ class Monitor:
         self.last_processes = {}
         self.last_cpu = psutil.cpu_times(percpu=True)
         self.process_network = ProcessNetwork()
+        self.detector = Detector()
 
     def _cpu_details(self):
         sockets = set(re.findall(r'^physical id\s*:\s*(.+)$', self.cpuinfo, re.M))
@@ -257,6 +259,8 @@ class Monitor:
             if result['nets'][name]['wifi']:
                 result['nets'][name].update(wifi_link(name))
         result['process_network_status'] = self.process_network.sample(rows,[(name,d['identity']) for name,d in result['nets'].items() if d['connected']])
+        # Runs where the data is collected, so a remote server checks full command lines before stripping them.
+        result['threats'] = self.detector.assess(rows,len(times))
         self.last_net_ids = {name:d['identity'] for name,d in result['nets'].items()}
         self.net_hardware = {name:self.net_hardware[name] for name in result['nets']}
         gpus = gpu_devices()
@@ -293,6 +297,7 @@ class Monitor:
 
     def close(self):
         self.process_network.close()
+        self.detector.close()  # removes the trap files
 
 
 def terminate_process(pid, created):

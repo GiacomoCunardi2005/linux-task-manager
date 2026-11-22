@@ -56,9 +56,6 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(group['network'],300)
         self.assertEqual([row['pid'] for row in group['children']],[1,2,3])
         self.assertNotIn('_parent',rows[0])
-        remote_scripts = [dict(base,pid=i,name='python',exe='/usr/bin/python',cmdline=[],command_id=digest*64)
-            for i,digest in ((101,'a'),(102,'a'),(103,'b'))]
-        self.assertEqual(sorted(len(row.get('children',[row])) for row in process_groups(remote_scripts)),[1,2])
 
     def test_group_expansion_child_selection_and_pid_filter_survive_refresh(self):
         window = Window()
@@ -99,6 +96,41 @@ class ProcessTests(unittest.TestCase):
             page.search.clear()
             self.app.processEvents()
             window.grab().save('reference/linux-processes-group-fixture.png')
+        finally:
+            window.close()
+
+    def test_suspicious_processes_are_marked_and_searchable(self):
+        window = Window()
+        window.show()
+        try:
+            wait(1400)
+            window.timer.stop()
+            window.sampler.wait()
+            page = window.process_page
+            base = dict(created=1.,status='sleeping',user='test',uid=os.getuid(),cpu=1.,memory=1024,disk=0,network=100)
+            rows = [dict(base,pid=987661,name='miner',exe='/tmp/miner'),dict(base,pid=987662,name='miner',exe='/tmp/miner'),
+                    dict(base,pid=987663,name='quiet',exe='/usr/bin/quiet')]
+            threats = dict(processes=[dict(pid=987662,created=1.,severity='alta',reasons=['Parametri tipici di un miner'])],
+                           system=[dict(severity='media',reason='Nuova tastiera USB collegata')])
+            page.receive(dict(window.snapshot,process_rows=rows,threats=threats))
+            statuses = {page.proxy.index(i,0).data():page.proxy.index(i,1).data() for i in range(page.proxy.rowCount())}
+            self.assertEqual(statuses['miner (2)'],'Sospetto')
+            self.assertNotEqual(statuses['quiet'],'Sospetto')
+            group = next(i for i in range(page.proxy.rowCount()) if page.proxy.index(i,0).data() == 'miner (2)')
+            self.assertIn('miner',page.proxy.index(group,1).data(Qt.ToolTipRole))
+            self.assertIn('1 processi da verificare (cerca «sospetto»), 1 avvisi di sistema',page.status.text())
+            self.assertIn('tastiera USB',page.status.toolTip())
+            page.search.setText('sospetto')
+            self.assertEqual(page.proxy.rowCount(),1)
+            root = page.proxy.index(0,0)
+            children = {page.proxy.index(i,6,root).data():page.proxy.index(i,1,root).data() for i in range(page.proxy.rowCount(root))}
+            self.assertEqual(children['987662'],'Sospetto')
+            self.assertNotEqual(children['987661'],'Sospetto')
+            page.search.clear()
+            legacy = dict(window.snapshot,process_rows=rows)
+            legacy.pop('threats')
+            page.receive(legacy)
+            self.assertIn('Controlli di sicurezza non disponibili',page.status.text())
         finally:
             window.close()
 

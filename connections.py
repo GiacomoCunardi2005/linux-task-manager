@@ -92,7 +92,7 @@ class ConnectionsPage(QWidget):
     def receive(self,nodes):
         if nodes is None:
             nodes = []
-            self.notice.setText('Questo server non espone i collegamenti: aggiorna la versione server.')
+            self.notice.setText('Collegamenti non disponibili.')
         else:
             self.notice.setText('USB-C indica il connettore. USB4 / Thunderbolt viene associato a una presa solo quando il kernel espone il collegamento. I controller non sono prese fisiche.')
             if any(n['kind']=='Controller host' for n in nodes) and not any(dict(n['details']).get('Associazione USB4 / Thunderbolt')=='Confermata dal kernel' for n in nodes):

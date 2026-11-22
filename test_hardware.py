@@ -372,8 +372,6 @@ class HotplugUITests(unittest.TestCase):
             window.toggle_pause()
             self.assertNotIn('device',page.items)
             self.assertIsNone(page.tree.currentItem())
-            window.switch_monitor(Monitor())
-            self.assertFalse(page.items)
         finally:
             window.close()
 

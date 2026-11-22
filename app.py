@@ -11,10 +11,9 @@ from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QIcon, QPixmap, 
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QToolButton, QScrollArea, QFrame, QGridLayout, QMenu, QSizeGrip, QProgressBar, QStackedWidget,
-    QDialog, QFormLayout, QLineEdit, QSpinBox, QDialogButtonBox, QMessageBox, QSizePolicy, QLayout)
+    QMessageBox, QSizePolicy, QLayout)
 from metrics import Monitor, read, size, percent, uptime
 from processes import ProcessPage
-from remote import RemoteMonitor, PORT
 from connections import ConnectionsPage, connection_summary
 
 COLORS = {'cpu':'#42a7bf', 'memory':'#8b8fd7', 'disks':'#9bc86b', 'nets':'#d48bbb', 'gpus':'#aa92d0', 'npus':'#d4a5db', 'connections':'#7daeb8'}
@@ -183,10 +182,6 @@ class TitleBar(QWidget):
         window.source_label = label('Gestione attività · PC locale',12)
         row.addWidget(window.source_label)
         row.addStretch()
-        window.connect_button = QPushButton('Connetti a un server')
-        window.connect_button.setAccessibleName('Connetti a un server remoto tramite IP')
-        window.connect_button.clicked.connect(window.connection_dialog)
-        row.addWidget(window.connect_button)
         for name, title, action in [('min','Riduci a icona',window.showMinimized), ('max','Ingrandisci / ripristina',self.maximize), ('close','Chiudi',window.close)]:
             button = QToolButton()
             button.setIcon(icon(name))
@@ -399,94 +394,6 @@ class Window(QWidget):
         self.sampler.ready.connect(lambda data: self.receive(data) if self.monitor is monitor else None)
         self.sampler.failed.connect(lambda error: self.show_error(error) if self.monitor is monitor else None)
 
-    def connection_dialog(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle('Collegamento a un server')
-        dialog.setStyleSheet('QDialog { background:#202020; }')
-        dialog.setMinimumWidth(470)
-        layout = QVBoxLayout(dialog)
-        description = label('Installa la versione server sul PC da monitorare. Inserisci il suo IP e la chiave mostrata sul server. Collegamento cifrato, in sola lettura.',12)
-        description.setWordWrap(True)
-        layout.addWidget(description)
-        form = QFormLayout()
-        host = QLineEdit()
-        host.setPlaceholderText('192.168.1.50 oppure nome host')
-        host.setAccessibleName('IP o nome del server')
-        port = QSpinBox()
-        port.setRange(1,65535)
-        port.setValue(PORT)
-        key = QLineEdit()
-        key.setEchoMode(QLineEdit.Password)
-        key.setPlaceholderText('Copia la chiave completa dal server')
-        key.setAccessibleName('Chiave di accesso al server')
-        if isinstance(self.monitor,RemoteMonitor):
-            host.setText(self.monitor.host)
-            port.setValue(self.monitor.port)
-        form.addRow('IP / host',host)
-        form.addRow('Porta',port)
-        form.addRow('Chiave di accesso',key)
-        layout.addLayout(form)
-        error = label('',11,'#ffb4ab')
-        error.setWordWrap(True)
-        layout.addWidget(error)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText('Connetti')
-        buttons.button(QDialogButtonBox.Cancel).setText('Annulla')
-        buttons.rejected.connect(dialog.reject)
-        def connect():
-            try:
-                monitor = RemoteMonitor(host.text(),port.value(),key.text())
-            except ValueError as exc:
-                error.setText(str(exc))
-                return
-            dialog.accept()
-            self.switch_monitor(monitor)
-        buttons.accepted.connect(connect)
-        layout.addWidget(buttons)
-        if isinstance(self.monitor,RemoteMonitor):
-            local = buttons.addButton('Torna al PC locale',QDialogButtonBox.ResetRole)
-            local.clicked.connect(lambda: (dialog.accept(),self.switch_monitor(Monitor())))
-        dialog.exec()
-        key.clear()
-
-    def switch_monitor(self,monitor):
-        self.timer.stop()
-        self.sampler.wait()
-        old = self.monitor
-        self.monitor = monitor
-        self.sampler.deleteLater()
-        old.close()
-        self.snapshot = None
-        self.histories.clear()
-        self.device_ids = {}
-        self.paused = False
-        self.pause.setText('Sospendi')
-        self.pause.setIcon(icon('pause'))
-        self.core_action.setChecked(False)
-        self.process_page.reset(isinstance(monitor,RemoteMonitor))
-        self.sync_resources({'disks':{},'nets':{},'gpus':{},'npus':{}})
-        for resource in self.resources.values():
-            if resource.graph:
-                resource.graph.samples, resource.graph.secondary = [],[]
-                resource.graph.update()
-            resource.subtitle.setText('In attesa')
-        self.connection_page.receive([])
-        self.select('cpu','cpu')
-        self.device.setText(monitor.cpu_name)
-        self.set_stats([],[])
-        self.composition.hide()
-        self.composition_label.hide()
-        self.info_text = 'In attesa dei contatori'
-        self.notice.setText('Collegamento al server…' if isinstance(monitor,RemoteMonitor) else 'Lettura dei contatori locali…')
-        self.source_label.setText(self.source_text())
-        self.connect_button.setText('Connessione / PC locale' if isinstance(monitor,RemoteMonitor) else 'Connetti a un server')
-        self.make_sampler()
-        self.timer.start(1000)
-        self.poll()
-
-    def source_text(self):
-        return 'Remoto · '+self.monitor.host+' · sola lettura' if isinstance(self.monitor,RemoteMonitor) else 'Gestione attività · PC locale'
-
     def show_page(self,key):
         self.pages.setCurrentIndex(0 if key == 'processes' else 1)
         for button,text in self.navbuttons:
@@ -547,7 +454,6 @@ class Window(QWidget):
             self.sampler.start()
 
     def receive(self,data):
-        self.source_label.setText(self.source_text())
         self.snapshot = data
         self.sync_resources(data)
         self.process_page.receive(data)
@@ -572,8 +478,6 @@ class Window(QWidget):
             self.render()
 
     def show_error(self,error):
-        if isinstance(self.monitor,RemoteMonitor):
-            self.source_label.setText('Remoto · '+self.monitor.host+' · collegamento interrotto')
         self.notice.setText(error+' — nuovo tentativo tra un secondo.')
         self.process_page.status.setText(error+' — nuovo tentativo tra un secondo.')
 
@@ -632,10 +536,10 @@ class Window(QWidget):
         data = self.snapshot
         for (kind,key),button in self.resources.items():
             if kind == 'connections':
-                nodes = data.get('connections')
-                summary = connection_summary(nodes).removesuffix(' (firmware)').replace('Conteggio prese non disponibile','Prese non rilevate') if nodes is not None else 'Aggiorna il server'
+                nodes = data.get('connections',[])
+                summary = connection_summary(nodes).removesuffix(' (firmware)').replace('Conteggio prese non disponibile','Prese non rilevate')
                 button.subtitle.setText('USB / Thunderbolt\n'+summary)
-                button.setToolTip(connection_summary(nodes) if nodes is not None else 'Aggiorna il server')
+                button.setToolTip(connection_summary(nodes))
                 continue
             d = data[kind] if kind in ('cpu','memory') else data[kind].get(key)
             if d is None:

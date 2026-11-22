@@ -31,7 +31,7 @@ def process_groups(rows):
                 program = parent_program
         args = row.get('cmdline',[])
         interpreter = program.startswith(('python','pypy')) or program in ('node','nodejs','java','bash','sh')
-        script = ((row['command_id'],) if row.get('command_id') else tuple(args[1:])) if interpreter else ()
+        script = tuple(args[1:]) if interpreter else ()
         key = (row.get('uid',row['user']),program,script)
         groups.setdefault(key,[]).append(row)
     result = []
@@ -57,6 +57,7 @@ class ProcessModel(QAbstractItemModel):
         super().__init__()
         self.rows = []
         self.totals = {}
+        self.threats, self.system_threats, self.threats_available, self.traps = {}, [], True, []
         self.fallback_icon = fallback_icon
         self.icons = {}
         icon_paths = [str(Path(path)/'icons') for path in QStandardPaths.standardLocations(QStandardPaths.GenericDataLocation)]
@@ -103,6 +104,9 @@ class ProcessModel(QAbstractItemModel):
         parent = index.internalPointer().get('_parent')
         return self.createIndex(parent['_row'],0,parent) if parent else QModelIndex()
 
+    def findings(self,row):
+        return [self.threats[key] for key in [(p['pid'],p['created']) for p in row.get('children',[row])] if key in self.threats]
+
     def record(self,index):
         return index.internalPointer() if index.isValid() else None
 
@@ -115,6 +119,16 @@ class ProcessModel(QAbstractItemModel):
         row, column = self.record(index), index.column()
         name = row['name']+(f" ({len(row['children'])})" if 'children' in row else '')
         values = [name,STATES.get(row['status'],row['status'] or 'N/D'),row['cpu'],row['memory'],row['disk'],row.get('network'),row['pid']]
+        findings = self.findings(row) if column == 1 else []
+        if findings:
+            alarm = 'alta' if any(f['severity'] == 'alta' for f in findings) else 'media'
+            values[1] = 'Sospetto' if alarm == 'alta' else 'Da verificare'
+            if role == Qt.ForegroundRole:
+                return QColor('#ff99a4' if alarm == 'alta' else '#f5c26b')
+            if role == Qt.ToolTipRole:
+                return '\n'.join(f"PID {f['pid']} · rischio {f['severity']}: "+'; '.join(f['reasons']) for f in findings)+'\nSegnali euristici, non una diagnosi antivirus.'
+            if role == SORT_ROLE:
+                return ('0' if alarm == 'alta' else '1')+values[1].casefold()
         value = values[column]
         if role == SORT_ROLE:
             return (-1 if value is None else value) if column >= 2 else str(value).casefold()
@@ -174,6 +188,11 @@ class ProcessModel(QAbstractItemModel):
         self.beginResetModel()
         self.process_count = len(data['process_rows'])
         self.rows = process_groups(data['process_rows'])
+        threats = data.get('threats')
+        self.threats_available = threats is not None
+        self.threats = {(f['pid'],f['created']):f for f in (threats or {}).get('processes',[])}
+        self.system_threats = (threats or {}).get('system',[])
+        self.traps = (threats or {}).get('traps',[])
         disk_loads = [d['value'] for d in data['disks'].values() if d['value'] is not None]
         self.totals = {2:f"{data['cpu']['value']:.0f}%",3:f"{data['memory']['value']:.0f}%",
             4:f"{max(disk_loads):.0f}%" if disk_loads else 'N/D',
@@ -186,8 +205,10 @@ class ProcessModel(QAbstractItemModel):
 class ProcessFilter(QSortFilterProxyModel):
     def filterAcceptsRow(self,row,parent):
         query = getattr(self,'query','')
-        item = self.sourceModel().record(self.sourceModel().index(row,0,parent))
-        return query in f"{item['name']} {item['pid']} {item['user']}".casefold()
+        model = self.sourceModel()
+        item = model.record(model.index(row,0,parent))
+        flagged = ' sospetto da verificare' if model.findings(item) else ''
+        return query in f"{item['name']} {item['pid']} {item['user']}{flagged}".casefold()
 
 
 class HeatDelegate(QStyledItemDelegate):
@@ -207,7 +228,6 @@ class ProcessPage(QWidget):
         super().__init__()
         self.setObjectName('process-page')
         self.paused = False
-        self.read_only = False
         self.latest = None
         root = QVBoxLayout(self)
         root.setContentsMargins(0,0,0,0)
@@ -272,18 +292,20 @@ class ProcessPage(QWidget):
         self.status.setStyleSheet('color:#bdbdbd; padding:8px 16px; font-size:11px;')
         root.addWidget(self.status)
 
-    def reset(self,read_only=False):
-        self.read_only = read_only
+    def reset(self):
         self.latest = None
         self.paused = False
         self.pause.setText('Sospendi')
         self.search.clear()
         self.model.beginResetModel()
         self.model.rows, self.model.totals = [],{}
+        self.model.threats, self.model.system_threats, self.model.threats_available, self.model.traps = {}, [], True, []
         self.model.process_count = 0
         self.model.endResetModel()
         self.selection_changed()
-        self.status.setText('In attesa dei processi remoti…' if read_only else 'Lettura dei processi…')
+        self.status.setText('Lettura dei processi…')
+        self.status.setStyleSheet('color:#bdbdbd; padding:8px 16px; font-size:11px;')
+        self.status.setToolTip('')
 
     def selected(self):
         rows = self.table.selectionModel().selectedRows()
@@ -293,14 +315,14 @@ class ProcessPage(QWidget):
 
     def targets(self,row):
         """Processes of the selection that may be stopped: the row itself, or every child of a group."""
-        if self.read_only or not row:
+        if not row:
             return []
         return [p for p in row.get('children',[row]) if p['uid'] == os.getuid() and p['created'] is not None
                 and p['pid'] is not None and p['pid'] not in (0,1,os.getpid())]
 
     def selection_changed(self,*args):
         row = self.selected()
-        self.end_task.setToolTip('Monitoraggio remoto in sola lettura' if self.read_only else 'Termina tutti i processi del gruppo' if row and 'children' in row else 'Termina il processo selezionato')
+        self.end_task.setToolTip('Termina tutti i processi del gruppo' if row and 'children' in row else 'Termina il processo selezionato')
         self.end_task.setEnabled(bool(self.targets(row)))
 
     def filter_changed(self,text):
@@ -337,7 +359,22 @@ class ProcessPage(QWidget):
         self.update_status()
 
     def update_status(self):
-        self.status.setText(f"{getattr(self.model,'process_count',0)} processi · {self.proxy.rowCount()} applicazioni/voci · "+(self.latest.get('process_network_status','Rete in attesa') if self.latest else 'Rete in attesa')+(' · Aggiornamento sospeso' if self.paused else ''))
+        model = self.model
+        flagged = len(model.threats)
+        system = model.system_threats
+        if not model.threats_available:
+            security = ' · Controlli di sicurezza non disponibili'
+        elif flagged or system:
+            security = ' · ⚠ '+', '.join(([f'{flagged} processi da verificare (cerca «sospetto»)'] if flagged else [])
+                +([f'{len(system)} avvisi di sistema (dettagli nel tooltip)'] if system else []))
+        else:
+            security = ' · Nessun comportamento sospetto rilevato'
+        self.status.setText(f"{getattr(model,'process_count',0)} processi · {self.proxy.rowCount()} applicazioni/voci · "+(self.latest.get('process_network_status','Rete in attesa') if self.latest else 'Rete in attesa')+security+(' · Aggiornamento sospeso' if self.paused else ''))
+        alarm = any(f['severity'] == 'alta' for f in list(model.threats.values())+system)
+        self.status.setStyleSheet('padding:8px 16px; font-size:11px; color:'+('#ff99a4' if alarm else '#f5c26b' if flagged or system else '#bdbdbd')+';')
+        self.status.setToolTip('\n'.join(f"Rischio {f['severity']}: {f['reason']}" for f in system)+('\n' if system else '')
+            +'Controlli euristici sui dati raccolti: non sostituiscono un antivirus. Eccezioni: ~/.config/linux-task-manager/detection-ignore.txt'
+            +('\nTrappole attive (non aprirle): '+', '.join(model.traps) if model.traps else '\nNessuna trappola attiva'))
 
     def toggle_pause(self):
         self.paused = not self.paused
