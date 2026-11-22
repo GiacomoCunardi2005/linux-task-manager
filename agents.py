@@ -34,6 +34,7 @@ class AgentScanner:
         self.home, self.baseline, self.downloads = Path(home), Path(baseline), downloads and Path(downloads)
         self.commands, self.interval = commands, interval  # detection.COMMANDS, passed in to avoid a circular import
         self.cache, self.findings, self.time = {}, [], -1e9
+        self.md_cache = {}  # path -> (mtime/size, commands, Bash(*)): keeping ~4000 skill texts would cost ~30 MB
 
     # --- reading, with an mtime cache: thousands of plugin files, few of which change ---
     def text(self,path):
@@ -189,18 +190,30 @@ class AgentScanner:
         return items,found
 
     def markdown(self,path,label,found):
-        text = self.text(path) or ''
-        items = []
-        for index,match in enumerate(DYNAMIC.finditer(text)):
-            command = match[1].strip()
-            first = command.split()[0] if command.split() else ''
-            # Documentation often talks about the `!` syntax in prose; only an executable or a path is a command.
-            if first.startswith(('/','./','~/','$')) or shutil.which(first):
-                items.append((f'dyn|{path}|{index}',f'{label}: comando eseguito prima del modello in {short(path)}',command))
-        frontmatter = text.split('\n---',1)[0] if text.startswith('---') else ''
-        if path.name == 'SKILL.md' and re.search(r'allowed-tools:.*Bash\(\*\)',frontmatter):
+        try:
+            info = os.stat(path)
+        except OSError:
+            return []
+        key = (info.st_mtime_ns,info.st_size)
+        if self.md_cache.get(path,(None,))[0] != key:
+            try:
+                with open(path,encoding='utf-8',errors='replace') as handle:
+                    text = handle.read(1_000_000)
+            except OSError:
+                return []
+            commands = []
+            for index,match in enumerate(DYNAMIC.finditer(text)):
+                command = match[1].strip()
+                first = command.split()[0] if command.split() else ''
+                # Documentation often talks about the `!` syntax in prose; only an executable or a path is a command.
+                if first.startswith(('/','./','~/','$')) or shutil.which(first):
+                    commands.append((index,command))
+            frontmatter = text.split('\n---',1)[0] if text.startswith('---') else ''
+            self.md_cache[path] = (key,commands,path.name == 'SKILL.md' and bool(re.search(r'allowed-tools:.*Bash\(\*\)',frontmatter)))
+        _,commands,bash_all = self.md_cache[path]
+        if bash_all:
             found.append(('media',f'{label}: {short(path)} si concede qualsiasi comando shell senza conferma (Bash(*))'))
-        return items
+        return [(f'dyn|{path}|{index}',f'{label}: comando eseguito prima del modello in {short(path)}',command) for index,command in commands]
 
     # --- scan with fingerprints ---
     def load(self):
