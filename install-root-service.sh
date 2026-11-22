@@ -92,7 +92,9 @@ EOF
 chmod 0644 "$unit" "$policy"
 
 systemctl daemon-reload
-systemctl enable --now linux-task-manager-root.service
+systemctl enable linux-task-manager-root.service
+# restart, not just --now: an already running service would keep executing the old code
+systemctl restart linux-task-manager-root.service
 sleep 2
 systemctl --no-pager --lines=5 status linux-task-manager-root.service || true
 echo "Servizio root attivo per l'utente $user. Dopo ogni aggiornamento del progetto rilancia: sudo $0"
