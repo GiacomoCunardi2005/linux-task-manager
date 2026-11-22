@@ -13,6 +13,8 @@ import subprocess
 import threading
 import time
 import psutil
+import pwd
+import select
 
 SYSTEM_DIRS = ('/usr/','/bin/','/sbin/','/lib','/opt/','/snap/','/app/','/nix/store/','/var/lib/flatpak/')
 KERNEL_THREAD = re.compile(r'(kworker|kthreadd|ksoftirqd|kswapd|migration/|rcu_|watchdog|kblockd|irq/|kcompactd|khugepaged)')
@@ -91,6 +93,7 @@ class Traps:
         # Persistent (not /run) so traps left in /var/tmp or home by a crash are still removed after a reboot.
         self.registry = Path(registry or cache/'linux-task-manager'/'traps')
         self.paths, self.hits, self.fd, self.fan = {}, [], None, None
+        self.fan_lock, self.fan_seen, self.fan_thread = threading.Lock(), {}, None
 
     def arm(self):
         libc = ctypes.CDLL(None,use_errno=True)
@@ -102,6 +105,10 @@ class Traps:
             raise OSError(ctypes.get_errno(),'inotify non disponibile')
         fan = libc.fanotify_init(0x1 | 0x2,os.O_RDONLY | os.O_CLOEXEC | getattr(os,'O_LARGEFILE',0))  # FAN_CLOEXEC | FAN_NONBLOCK
         self.fan = fan if fan >= 0 else None
+        if self.fan is not None:
+            # A reader like `cat` exits within milliseconds: describe it the moment fanotify reports it.
+            self.fan_thread = threading.Thread(target=self.fan_loop,args=(self.fan,),daemon=True)
+            self.fan_thread.start()
         self.registry.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.remove_stale()
         for place in self.places:
@@ -171,14 +178,35 @@ class Traps:
                 continue
         return found
 
-    def fanotify_pids(self):
-        """PIDs per trap path from fanotify; each event carries an open fd that must be closed."""
-        found = {}
-        while self.fan is not None:
+    @staticmethod
+    def describe(pid):
+        """(process name, readable description) straight from /proc, or None once the process is gone."""
+        try:
+            with open(f'/proc/{pid}/comm') as handle:
+                name = handle.read().strip()
+            with open(f'/proc/{pid}/status') as handle:
+                uid = int(next(line for line in handle if line.startswith('Uid:')).split()[1])
+        except (OSError,StopIteration,ValueError):
+            return None
+        try:
+            user = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            user = str(uid)
+        try:
+            exe = os.readlink(f'/proc/{pid}/exe').removesuffix(' (deleted)')
+        except OSError:
+            exe = ''
+        return name,f"{name}, utente {user}"+(f", {exe}" if exe else '')
+
+    def fan_loop(self,fan):
+        while self.fan == fan:
             try:
-                data = os.read(self.fan,65536)
+                ready,_,_ = select.select([fan],[],[],0.5)
+                data = os.read(fan,65536) if ready else b''
             except BlockingIOError:
-                break
+                continue
+            except (OSError,ValueError):
+                return  # descriptor closed by close()
             offset = 0
             while offset+24 <= len(data):
                 length,_,_,_,_,event_fd,pid = struct.unpack_from('IBBHQii',data,offset)
@@ -187,14 +215,25 @@ class Traps:
                     continue
                 try:
                     path = os.readlink(f'/proc/self/fd/{event_fd}')
+                except OSError:
+                    continue
                 finally:
                     os.close(event_fd)
                 if pid > 0 and pid != os.getpid():
-                    found.setdefault(path,set()).add(pid)
-        return found
+                    description = self.describe(pid)
+                    with self.fan_lock:
+                        seen = self.fan_seen.setdefault(path,{})
+                        seen[pid] = (time.monotonic(),description or (seen.get(pid) or (0,None))[1])
+
+    def take_fan_seen(self):
+        now = time.monotonic()
+        with self.fan_lock:
+            seen, self.fan_seen = self.fan_seen, {}
+        # Events older than a few seconds belong to an inotify batch already reported.
+        return {path:{pid:desc for pid,(when,desc) in pids.items() if now-when < 5} for path,pids in seen.items()}
 
     def poll(self):
-        fan_pids = self.fanotify_pids()
+        fan_seen = self.take_fan_seen()
         masks = {}
         while True:
             try:
@@ -215,15 +254,11 @@ class Traps:
                 mask &= ~IN_ATTRIB  # unlink changes the link count, which inotify reports as IN_ATTRIB
             actions = [(level,text) for bit,level,text in TRAP_EVENTS if mask & bit]
             if actions:
-                pids = sorted(fan_pids.get(str(path),set()) | set(self.openers(path)))
-                names = []
-                for pid in pids:
-                    try:
-                        proc = psutil.Process(pid)
-                        names.append(proc.name())
-                    except psutil.Error:
-                        names.append('già terminato')
-                who = (' da '+', '.join(f'PID {pid} ({name})' for pid,name in zip(pids,names)) if pids else
+                seen = fan_seen.get(str(path),{})
+                pids = sorted(set(seen) | set(self.openers(path)))
+                described = [seen.get(pid) or self.describe(pid) or ('già terminato','già terminato') for pid in pids]
+                names = [name for name,_ in described]
+                who = (' da '+', '.join(f'PID {pid} ({text})' for pid,(_,text) in zip(pids,described)) if pids else
                        ' (processo non identificabile: già chiuso, o senza il servizio root)')
                 level = 'alta' if any(a[0] == 'alta' for a in actions) else 'media'
                 self.hits.append(dict(severity=level,pids=pids,names=names,reason=f"{clock} trappola {path} "+', '.join(a[1] for a in actions)+who))
@@ -239,10 +274,15 @@ class Traps:
         return self.hits
 
     def close(self):
-        for attribute in ('fd','fan'):
-            if getattr(self,attribute) is not None:
-                os.close(getattr(self,attribute))
-                setattr(self,attribute,None)
+        fan, self.fan = self.fan, None  # fan_loop stops when self.fan changes
+        if self.fan_thread:
+            self.fan_thread.join(1)
+            self.fan_thread = None
+        if fan is not None:
+            os.close(fan)
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
         for path,_ in self.paths.values():
             self.unlink(path)
         self.paths = {}

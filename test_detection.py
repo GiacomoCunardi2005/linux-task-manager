@@ -215,6 +215,48 @@ class TrapTests(unittest.TestCase):
         self.assertEqual([p['pid'] for p in result['processes']],[child.pid])
         self.assertIn('file trappola',result['processes'][0]['reasons'][0])
 
+    def test_fanotify_description_captured_at_event_time_is_used(self):
+        # fan_loop needs root; simulate what it records the instant a short-lived `cat` opens the trap.
+        with self.traps.fan_lock:
+            self.traps.fan_seen[str(self.first)] = {999999:(time.monotonic(),('cat','cat, utente root, /usr/bin/cat'))}
+            self.traps.fan_seen['/tmp/vecchio'] = {1:(time.monotonic()-60,('old','old'))}
+        self.first.read_bytes()
+        hit = self.traps.poll()[-1]
+        self.assertIn('da PID 999999 (cat, utente root, /usr/bin/cat)',hit['reason'])
+        self.assertEqual((hit['pids'],hit['names']),([999999],['cat']))
+        self.assertEqual(self.traps.fan_seen,{})  # consumed, stale entries dropped
+
+    def test_fan_loop_parses_events_and_closes_their_descriptors(self):
+        import struct, threading
+        child = subprocess.Popen(['sleep','30'])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        read_end,write_end = os.pipe()
+        self.addCleanup(os.close,write_end)
+        event_fd = os.open(self.first,os.O_RDONLY)
+        os.write(write_end,struct.pack('IBBHQii',24,3,0,24,0x20,event_fd,child.pid))
+        self.traps.fan = read_end
+        loop = threading.Thread(target=self.traps.fan_loop,args=(read_end,))
+        loop.start()
+        deadline = time.monotonic()+3
+        while not self.traps.fan_seen and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.traps.fan = None
+        loop.join(2)
+        os.close(read_end)
+        name,text = self.traps.take_fan_seen()[str(self.first)][child.pid]
+        self.assertEqual(name,'sleep')
+        self.assertIn('/sleep',text)
+        with self.assertRaises(OSError):
+            os.fstat(event_fd)  # the event's descriptor was closed
+
+    def test_describe_reads_name_user_and_executable(self):
+        name,text = Traps.describe(os.getpid())
+        self.assertEqual(name,Path(f'/proc/{os.getpid()}/comm').read_text().strip())
+        self.assertIn(f'utente {psutil.Process().username()}',text)
+        self.assertIn(os.path.realpath(sys.executable),text)
+        self.assertIsNone(Traps.describe(2**22+12345))
+
     def test_modification_is_high_and_deletion_rearms(self):
         with open(self.first,'ab') as handle:
             handle.write(b'encrypted')
