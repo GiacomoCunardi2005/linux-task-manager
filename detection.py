@@ -10,6 +10,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import threading
 import time
 import psutil
@@ -309,6 +310,35 @@ def parse_proc_events(data):
     return events
 
 
+def subscribe_exec_events():
+    sock = socket.socket(socket.AF_NETLINK,socket.SOCK_DGRAM,11)  # NETLINK_CONNECTOR
+    sock.bind((0,1))  # CN_IDX_PROC multicast group
+    sock.send(struct.pack('IHHII',16+20+4,3,0,0,0)+struct.pack('IIIIHH',1,1,0,0,4,0)+struct.pack('I',1))  # PROC_CN_MCAST_LISTEN
+    return sock
+
+
+def exec_watch_main():
+    """Child process: its own interpreter, so /proc is read within microseconds of exec, not after the
+    parent's sampling loop releases the GIL (up to 5 ms; a `cat` lives under 1 ms)."""
+    try:
+        sock = subscribe_exec_events()
+    except OSError as exc:
+        print(f'errore {exc}',flush=True)
+        return
+    print('ok',flush=True)
+    while True:
+        data = sock.recv(65536)
+        for pid,tgid in parse_proc_events(data):
+            if pid == tgid:
+                row = ExecWatcher.snapshot(tgid)
+                if row:
+                    try:
+                        sys.stdout.write(json.dumps(row)+'\n')
+                        sys.stdout.flush()
+                    except (BrokenPipeError,ValueError):
+                        return  # parent gone
+
+
 class ExecWatcher(threading.Thread):
     """Linux proc connector: notified on every exec(), so processes shorter than the 1 s sample are seen."""
     def __init__(self,detector):
@@ -317,23 +347,21 @@ class ExecWatcher(threading.Thread):
         # pid -> (time, (name, description)) of recent execs: a reader that exits before /proc can be read is
         # still named, because exec is reported before the program opens anything.
         self.recent = {}
-        self.sock = socket.socket(socket.AF_NETLINK,socket.SOCK_DGRAM,11)  # NETLINK_CONNECTOR
-        self.sock.bind((0,1))  # CN_IDX_PROC multicast group
-        message = struct.pack('IHHII',16+20+4,3,0,0,0)+struct.pack('IIIIHH',1,1,0,0,4,0)+struct.pack('I',1)  # PROC_CN_MCAST_LISTEN
-        self.sock.send(message)
+        self.child = subprocess.Popen([sys.executable,'-I','-B',str(Path(__file__).resolve()),'--exec-watch'],
+                                      stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL,text=True)
+        first = self.child.stdout.readline().strip()
+        if first != 'ok':
+            self.close()
+            raise OSError(first or 'osservatore degli avvii terminato')
 
     def run(self):
-        while True:
+        for line in self.child.stdout:
             try:
-                data = self.sock.recv(65536)
-            except OSError:
-                return
-            for pid,tgid in parse_proc_events(data):
-                if pid == tgid:
-                    row = self.snapshot(tgid)
-                    if row:
-                        self.remember(row)
-                        self.detector.exec_seen(row)
+                row = json.loads(line)
+            except ValueError:
+                continue
+            self.remember(row)
+            self.detector.exec_seen(row)
 
     def remember(self,row):
         try:
@@ -371,7 +399,9 @@ class ExecWatcher(threading.Thread):
         return dict(pid=pid,created=created,name=name,exe=exe and exe.removesuffix(' (deleted)'),cmdline=cmdline,ppid=ppid,uid=uid)
 
     def close(self):
-        self.sock.close()
+        if self.child.poll() is None:
+            self.child.kill()
+        self.child.wait()
 
 
 def validate_threats(threats):
@@ -572,3 +602,7 @@ class Detector:
     def close(self):
         if self.traps:
             self.traps.close()
+
+
+if __name__ == '__main__' and sys.argv[1:] == ['--exec-watch']:
+    exec_watch_main()
