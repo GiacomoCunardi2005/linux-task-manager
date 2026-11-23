@@ -18,6 +18,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))  # python -I does not ad
 import psutil
 from detection import Detector, Traps, ExecWatcher, ProcessScanner, crontab, default_places
 from netwatch import NetWatch
+from filewatch import FileWatch, personal_roots
 
 CONFIG = Path('/etc/linux-task-manager/service.json')
 # Root-owned ignore list: a user-writable one would let user-level malware switch the checks off.
@@ -40,19 +41,43 @@ def network_findings(anomalies):
     for item in anomalies:
         if item['score'] >= 70:
             names = ', '.join(INDICATORS.get(i,i) for i in item.get('indicators',[])) or item['kind']
+            label = 'nome del dominio da verificare' if item['kind'] == 'idn' else 'comportamento anomalo'
             found.append(dict(severity='alta' if item['score'] >= 90 else 'media',
-                reason=f"Rete: comportamento anomalo — {item['subject']} ({names})"+(f", processo {item['process']}" if item.get('process') else '')))
+                reason=f"Rete: {label} — {item['subject']} ({names})"+(f", processo {item['process']}" if item.get('process') else '')))
     return found
 
 
 INDICATORS = dict(beacon='periodico',sizes='dimensioni costanti',persist='persistente',new='destinazione nuova',volume='molti dati inviati',
-                  short='connessioni brevissime',iforest='profilo insolito',dnsfirst='DNS prima di ogni connessione')
+                  short='connessioni brevissime',iforest='profilo insolito',dnsfirst='DNS prima di ogni connessione',idn='lettere non ASCII o Punycode')
+
+
+def add_file_findings(threats,findings,status):
+    by_identity = {(f['pid'],f['created']):f for f in threats['processes']}
+    for finding in findings:
+        finding = dict(finding,notification_reasons=['modifiche-file:'+finding['severity']])
+        identity = (finding['pid'],finding['created'])
+        if identity not in by_identity:
+            threats['processes'].append(finding)
+            by_identity[identity] = finding
+        else:
+            existing = by_identity[identity]
+            existing['notification_reasons'] = existing.get('notification_reasons',list(existing['reasons']))+finding['notification_reasons']
+            existing['severity'] = 'alta' if 'alta' in (existing['severity'],finding['severity']) else 'media'
+            existing['reasons'] = list(dict.fromkeys(existing['reasons']+finding['reasons']))[:32]
+    threats['file_activity'] = status
 
 
 def state(rows,threats,uid,features,network=None):
-    # Only fields the unprivileged app cannot read itself for other users' processes.
-    extra = {f"{r['pid']}:{r['created']!r}":dict(exe=r['exe'],disk=r['disk']) for r in rows if r['uid'] != uid}
-    return dict(version=1,time=time.time(),user=uid,threats=threats,processes=extra,features=features,network=network)
+    # Publish coherent observations, never supplement a new image with an old image's exe/I/O.
+    observed = time.time()
+    extra = {f"{r['pid']}:{r['created']!r}":dict(r,observed_at=observed) for r in rows if r['uid'] != uid}
+    images = {(r['pid'],r['created']):r for r in rows}
+    findings = []
+    for finding in threats['processes']:
+        image = images.get((finding['pid'],finding['created']))
+        identity = {k:image[k] for k in ('boot_id','start_ticks','image_fingerprint','name','cmdline') if k in image} if image else {}
+        findings.append(dict(finding,image=identity))
+    return dict(version=1,time=observed,user=uid,threats=dict(threats,processes=findings),processes=extra,features=features,network=network)
 
 
 def write_state(data,gid,path=None):
@@ -76,21 +101,24 @@ def run():
     detector = Detector(home=user.pw_dir,config=IGNORE,traps=traps,read_crontab=lambda: crontab(user.pw_name)+crontab('root'),
                         agent_baseline=Path('/var/lib/linux-task-manager/agents.json'))
     features = dict(fanotify=False,exec=False)
+    sampler = Sampler()
     try:
-        watcher = ExecWatcher(detector)
+        watcher = ExecWatcher(detector,on_exec=sampler.exec_seen)
         traps.lookup = watcher.recent_description
         watcher.start()
         features['exec'] = True
     except (OSError,RuntimeError) as exc:
         watcher = None
         print(f'Processi brevi non osservabili: {exc}',file=sys.stderr)
-    sampler = Sampler()
     watch = NetWatch(Path('/var/lib/linux-task-manager/network.json'),uid=user.pw_uid,ignore_path=NETWORK_IGNORE).start()
+    files = FileWatch(personal_roots(user.pw_dir)).start()
     try:
         while not stop:
             started = time.monotonic()
             rows = sampler.rows()
             threats = detector.assess(rows,sampler.cores)
+            add_file_findings(threats,files.poll(rows,detector.ignored()),files.status())
+            features['file_activity'] = threats['file_activity']['available']
             features['fanotify'] = traps.fan is not None
             anomalies = watch.poll()
             threats['system'] += network_findings(anomalies)
@@ -99,6 +127,7 @@ def run():
             write_state(state(rows,threats,user.pw_uid,features,network),user.pw_gid)
             time.sleep(max(0,1-(time.monotonic()-started)))
     finally:
+        files.close()
         watch.close()
         detector.close()
         if watcher:

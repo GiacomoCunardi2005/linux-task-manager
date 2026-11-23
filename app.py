@@ -2,18 +2,23 @@
 """Windows 11 inspired Processes and Performance views for Linux."""
 import argparse
 from collections import defaultdict, deque
+import json
+import os
 from pathlib import Path
 import signal
 import sys
+import tempfile
 import time
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QRectF, QEvent
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QIcon, QPixmap, QFont, QFontMetrics
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QSystemTrayIcon, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QToolButton, QScrollArea, QFrame, QGridLayout, QMenu, QSizeGrip, QProgressBar, QStackedWidget,
     QMessageBox, QSizePolicy, QLayout)
 from metrics import Monitor, read, size, percent, uptime
+from detection import program_file
 from processes import ProcessPage
 from connections import ConnectionsPage, connection_summary
 
@@ -901,10 +906,13 @@ class Window(QWidget):
 
     @staticmethod
     def alerts(data):
-        """{key: (severity, text)} for every current finding; the key changes when the reasons change."""
+        """{key: (severity, text)}; changing burst counters alone must not repeat a notification."""
         threats = data.get('threats') or {}
-        names = {row['pid']:row['name'] for row in data.get('process_rows',[])}
-        found = {('p',f['pid'],f['created'],tuple(f['reasons'])):(f['severity'],f"{names.get(f['pid'],'Processo')} (PID {f['pid']}): "+'; '.join(f['reasons']))
+        rows = {row['pid']:row for row in data.get('process_rows',[])}
+        def who(pid):
+            row = rows.get(pid,{})
+            return f"{row.get('name','Processo')} (PID {pid}) — {program_file(row.get('exe'),row.get('cmdline'))}"
+        found = {('p',f['pid'],f['created'],tuple(f.get('notification_reasons',f['reasons']))):(f['severity'],f"{who(f['pid'])}: "+'; '.join(f['reasons']))
                  for f in threats.get('processes',[])}
         found.update({('s',f['reason']):(f['severity'],f['reason']) for f in threats.get('system',[])})
         return found
@@ -1000,6 +1008,56 @@ class Tray(QSystemTrayIcon):
         self.messageClicked.connect(window.bring_to_front)
 
 
+def instance_path():
+    # $XDG_RUNTIME_DIR is private to the user: another account cannot squat the name or talk to the app.
+    return str(Path(os.environ.get('XDG_RUNTIME_DIR') or tempfile.gettempdir())/'linux-task-manager.sock')
+
+
+def forward_to_running(message,path=None):
+    """True when an instance is already running and received the message: this launch should just exit."""
+    sock = QLocalSocket()
+    sock.connectToServer(path or instance_path())
+    if not sock.waitForConnected(500):
+        return False
+    sock.write(json.dumps(message).encode())
+    sock.flush()
+    sock.waitForBytesWritten(1000)
+    sock.disconnectFromServer()
+    return True
+
+
+def listen_for_launches(window,path=None):
+    """A second launch (menu, GNOME notification click) brings this window forward instead of starting a copy."""
+    path = path or instance_path()
+    server = QLocalServer(window)
+    server.setSocketOptions(QLocalServer.UserAccessOption)
+    if not server.listen(path):
+        QLocalServer.removeServer(path)  # left by a crash: nobody answered forward_to_running()
+        server.listen(path)
+
+    def handle(connection):
+        try:
+            message = json.loads(bytes(connection.readAll()).decode() or '{}')
+        except ValueError:
+            return
+        if isinstance(message,dict) and message.get('action') == 'show':
+            token = message.get('token')
+            if isinstance(token,str) and token:
+                os.environ['XDG_ACTIVATION_TOKEN'] = token  # lets Wayland/GNOME really raise the window
+            window.bring_to_front()
+
+    def accepted():
+        while server.hasPendingConnections():
+            connection = server.nextPendingConnection()
+            connection.readyRead.connect(lambda c=connection: handle(c))
+            connection.disconnected.connect(connection.deleteLater)
+            if connection.bytesAvailable():
+                handle(connection)
+
+    server.newConnection.connect(accepted)
+    return server
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--screenshot',type=Path,help='Save an actual live render after 4 samples and exit')
@@ -1011,7 +1069,11 @@ def main():
     app.setDesktopFileName('linux-task-manager')
     app.setStyle('Fusion')
     app.setStyleSheet(STYLE)
+    if not args.screenshot and forward_to_running(dict(action='tray' if args.tray else 'show',
+            token=os.environ.get('XDG_ACTIVATION_TOKEN') or os.environ.get('DESKTOP_STARTUP_ID'))):
+        return 0  # already running: it shows its window (a second --tray launch at login changes nothing)
     window = Window()
+    window.instance_server = listen_for_launches(window)
     if QSystemTrayIcon.isSystemTrayAvailable():
         app.setQuitOnLastWindowClosed(False)
         window.tray = Tray(window)

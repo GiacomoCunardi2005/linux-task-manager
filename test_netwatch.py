@@ -1,18 +1,168 @@
 """Kernel collection tested for real inside a private network namespace (unshare -rn gives CAP_NET_RAW/ADMIN there)."""
 import json
+import os
 from pathlib import Path
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
-from netwatch import bpf_program, parse_dns, network_exceptions, excluded_destination, NetWatch
+from netwatch import bpf_program, parse_dns, network_exceptions, excluded_destination, NetWatch, DNSVerifier, ReverseDNS
 from netbehavior import NetworkAnalyzer
 
 
 class NetworkExceptionsTests(unittest.TestCase):
+    def test_idn_alert_is_not_hidden_by_destination_exceptions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'ignore.txt'
+            path.write_text('spotify.com\n192.0.2.1\n')
+            watch = NetWatch(Path(folder)/'baseline.json',ignore_path=path)
+            self.addCleanup(watch.close)
+            watch.analyzer.dns_event(100,'xn--bcher-kva.spotify.com',1,0,True,['192.0.2.1'])
+            watch.analyzer.syn(101,'192.0.2.1',443)
+            with patch.object(watch,'flows',return_value=[]), patch.object(watch,'user_idle',return_value=None), \
+                 patch.object(watch,'attribute'):
+                results = watch.poll(102)
+            self.assertEqual([item['kind'] for item in results],['idn'])
+
+    def test_reverse_dns_is_async_display_only_and_expires(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'ignore.txt'
+            path.write_text('spotify.com\n')
+            watch = NetWatch(Path(folder)/'baseline.json',ignore_path=path)
+            self.addCleanup(watch.close)
+            item = dict(kind='destinazione',key='8.8.8.8:443',subject='8.8.8.8:443',score=90)
+            started,release = threading.Event(),threading.Event()
+            def reverse(ip):
+                started.set()
+                release.wait(3)
+                return ('host.spotify.com',[],[ip])
+            with patch('netwatch.socket.gethostbyaddr',side_effect=reverse), \
+                 patch.object(watch,'flows',return_value=[]), patch.object(watch,'user_idle',return_value=None), \
+                 patch.object(watch,'attribute'), patch.object(watch.analyzer,'analyze',side_effect=lambda now:[dict(item)]), \
+                 patch('netwatch.socket.getaddrinfo',side_effect=socket.gaierror('no answer')):
+                try:
+                    self.assertEqual(watch.poll(500),[item])
+                    self.assertTrue(started.wait(1))
+                finally:
+                    release.set()
+                # Join the pending worker before checking the next snapshot.
+                for _ in range(100):
+                    with watch.reverse_dns.lock:
+                        pending = bool(watch.reverse_dns.pending)
+                    if not pending:
+                        break
+                    threading.Event().wait(.01)
+                result = watch.poll(531)
+                self.assertEqual(result[0]['reverse_name'],'host.spotify.com')
+                self.assertEqual(watch.analyzer.ip_domain,{})
+                stamp = watch.reverse_dns.cache['8.8.8.8'][0]
+                with patch('netwatch.time.monotonic',return_value=stamp+301), patch('netwatch.threading.Thread'):
+                    self.assertIsNone(watch.reverse_dns.lookup('8.8.8.8'))
+                self.assertIsNone(watch.reverse_dns.lookup('127.0.0.1'))
+
+    def test_explicit_domain_resolution_without_observed_dns(self):
+        verifier = DNSVerifier()
+        self.addCleanup(verifier.close)
+        analyzer = NetworkAnalyzer(now=100)
+        domain = 'gew4-dealer-ssl.spotify.com'
+        exceptions = ({domain},set())
+        item = dict(kind='destinazione',key='192.0.2.34:443')
+        answer = [(socket.AF_INET,socket.SOCK_STREAM,6,'',('192.0.2.34',0))]
+        with patch('netwatch.socket.getaddrinfo',return_value=answer):
+            verifier.resolve(domain)
+        self.assertTrue(excluded_destination(item,analyzer,exceptions,100,verifier))
+        self.assertFalse(excluded_destination(item,analyzer,(set(),set()),100,verifier))
+        analyzer.dns_event(100,'other.example',1,0,True,['192.0.2.34'])
+        self.assertFalse(excluded_destination(item,analyzer,exceptions,101,verifier))
+        with patch('netwatch.socket.getaddrinfo',return_value=[]):
+            verifier.resolve(domain)
+        analyzer.ip_domain.clear()
+        analyzer.dns_seen_at.clear()
+        self.assertFalse(excluded_destination(item,analyzer,exceptions,102,verifier))
+
+    def test_round_robin_answers_are_remembered_but_failures_forget(self):
+        verifier = DNSVerifier()
+        self.addCleanup(verifier.close)
+        answer = lambda *ips: [(socket.AF_INET,socket.SOCK_STREAM,6,'',(ip,0)) for ip in ips]
+        with patch('netwatch.socket.getaddrinfo',return_value=answer('140.82.113.26')):
+            verifier.resolve('alive.github.com')
+        with patch('netwatch.socket.getaddrinfo',return_value=answer('140.82.112.26')):
+            verifier.resolve('alive.github.com')  # the pool rotated
+        self.assertTrue(verifier.matches('alive.github.com','140.82.113.26'))
+        self.assertTrue(verifier.matches('alive.github.com','140.82.112.26'))
+        stamp = verifier.cache['alive.github.com'][0]
+        with patch('netwatch.time.monotonic',return_value=stamp+6*3600+1), \
+             patch('netwatch.socket.getaddrinfo',return_value=answer('140.82.114.26')):
+            verifier.resolve('alive.github.com')  # six hours later the old addresses are forgotten
+            self.assertFalse(verifier.matches('alive.github.com','140.82.113.26'))
+        with patch('netwatch.socket.getaddrinfo',side_effect=OSError):
+            verifier.resolve('alive.github.com')
+        self.assertFalse(verifier.matches('alive.github.com','140.82.114.26'))
+
+    def test_expired_spotify_dns_is_verified_without_blocking_poll(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'ignore.txt'
+            path.write_text('spotify.com\n')
+            watch = NetWatch(Path(folder)/'baseline.json',ignore_path=path)
+            self.addCleanup(watch.close)
+            watch.analyzer.dns_event(100,'api-partner.spotify.com',1,0,True,['192.0.2.1'])
+            items = [dict(kind='destinazione',key='192.0.2.1:443',score=90),dict(kind='spike',score=80)]
+            release,started = threading.Event(),threading.Event()
+            threads = []
+            real_thread = threading.Thread
+            def thread(*args,**kwargs):
+                worker = real_thread(*args,**kwargs)
+                threads.append(worker)
+                return worker
+            def resolve(*args):
+                started.set()
+                release.wait(3)
+                return [(socket.AF_INET,socket.SOCK_STREAM,6,'',('192.0.2.1',0))]
+            with patch('netwatch.socket.getaddrinfo',side_effect=resolve) as resolver, \
+                 patch('netwatch.threading.Thread',side_effect=thread), \
+                 patch.object(watch,'flows',return_value=[]), patch.object(watch,'user_idle',return_value=None), \
+                 patch.object(watch,'attribute'), patch.object(watch.analyzer,'analyze',return_value=items):
+                try:
+                    self.assertEqual(watch.poll(500),items)  # the pending resolver cannot block sampling
+                    self.assertTrue(started.wait(1))
+                    self.assertFalse(watch.dns_verifier.matches('api-partner.spotify.com','192.0.2.1'))
+                finally:
+                    release.set()
+                    for _ in range(200):  # the queued resolution finishes in a worker
+                        if 'api-partner.spotify.com' in watch.dns_verifier.cache:
+                            break
+                        time.sleep(.01)
+                resolver.assert_called_once_with('api-partner.spotify.com.',None,socket.AF_UNSPEC,socket.SOCK_STREAM)
+                self.assertEqual(watch.poll(531),[items[1]])
+                self.assertEqual(watch.analyzer.dns_seen_at['192.0.2.1'],100)
+                path.write_text('')
+                self.assertEqual(watch.poll(562),items)  # removing the rule overrides a cached success
+
+    def test_verification_rejects_changed_ip_errors_and_expired_cache(self):
+        verifier = DNSVerifier()
+        self.addCleanup(verifier.close)
+        answer = [(socket.AF_INET6,socket.SOCK_STREAM,6,'',('2001:db8::1',0,0,0))]
+        with patch('netwatch.socket.getaddrinfo',return_value=answer):
+            verifier.resolve('track.spotify.com')
+        self.assertTrue(verifier.matches('track.spotify.com','2001:db8::1'))
+        self.assertFalse(verifier.matches('track.spotify.com','192.0.2.1'))
+        stamp = verifier.cache['track.spotify.com'][0]
+        with patch('netwatch.time.monotonic',return_value=stamp+301), patch('netwatch.threading.Thread'):
+            self.assertFalse(verifier.matches('track.spotify.com','2001:db8::1'))
+        with patch('netwatch.socket.getaddrinfo',side_effect=socket.gaierror('offline')):
+            verifier.resolve('track.spotify.com')
+        self.assertFalse(verifier.matches('track.spotify.com','2001:db8::1'))
+        verifier.close()
+        with patch('netwatch.threading.Thread') as thread:
+            self.assertFalse(verifier.matches('track.spotify.com','2001:db8::1'))
+            thread.assert_not_called()
+
     def test_domains_ips_and_recent_dns_are_matched_precisely(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder)/'network-ignore.txt'
@@ -133,7 +283,7 @@ class KernelCollectionTests(unittest.TestCase):
         self.assertEqual(self.result['dns_before'],[3,3])  # each of the three connections followed its DNS answer
 
     def test_long_lived_flow_counters_from_ss(self):
-        self.assertEqual(self.result['long_flow'],[1235])  # bytes_acked includes the SYN; only deltas are used
+        self.assertEqual(self.result['long_flow'],[1234])  # compensate the same SYN byte as the close collector
 
 
 class ParserTests(unittest.TestCase):
@@ -158,3 +308,103 @@ class ParserTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RotatingDnsExceptionTests(unittest.TestCase):
+    """An allowed service whose DNS rotates must stay excluded for connections that were opened by name."""
+    class NeverMatches:
+        def matches(self,name,ip):
+            return False  # the name now resolves to other addresses
+
+    def analyzer(self):
+        analyzer = NetworkAnalyzer(dict(started=0.),now=0.)
+        analyzer.dns_event(100.,'alive.github.com',1,0,True,['140.82.113.26'])
+        analyzer.syn(100.4,'140.82.113.26',443)
+        return analyzer
+
+    def excluded(self,analyzer,now=4000.):
+        exceptions = (network_exceptions_from(['github.com']),set())
+        return excluded_destination(dict(kind='destinazione',key='140.82.113.26:443'),analyzer,exceptions,now,self.NeverMatches())
+
+    def test_connection_named_by_an_allowed_domain_survives_rotation(self):
+        self.assertTrue(self.excluded(self.analyzer()))
+
+    def test_connection_answered_from_the_resolver_cache_stays_named(self):
+        analyzer = self.analyzer()
+        analyzer.syn(3000.,'140.82.113.26',443)  # nss-resolve cache hit: no packet, but the address was answered 48 min ago
+        self.assertTrue(self.excluded(analyzer))
+
+    def test_connection_without_dns_keeps_it_visible(self):
+        analyzer = self.analyzer()
+        analyzer.syn(100.4+2*3600+60,'140.82.113.26',443)  # no answer for this address within the cache horizon
+        self.assertFalse(self.excluded(analyzer,now=100.4+2*3600+90))
+
+    def test_connection_named_by_another_domain_keeps_it_visible(self):
+        analyzer = self.analyzer()
+        analyzer.dns_event(3000.,'evil.example',1,0,True,['140.82.113.26'])
+        analyzer.syn(3000.5,'140.82.113.26',443)
+        self.assertFalse(self.excluded(analyzer))
+
+    def test_recent_other_name_wins_even_without_a_connection(self):
+        analyzer = self.analyzer()
+        analyzer.dns_event(3900.,'evil.example',1,0,True,['140.82.113.26'])
+        self.assertFalse(self.excluded(analyzer))
+
+    def test_record_is_dropped_with_the_destination(self):
+        analyzer = self.analyzer()
+        analyzer.prune(100.4+3*3600)
+        self.assertNotIn('140.82.113.26:443',analyzer.contact_names)
+
+
+def network_exceptions_from(domains):
+    return set(domains)
+
+
+class UnconfirmedExplanationTests(unittest.TestCase):
+    def test_visible_allowed_name_says_why(self):
+        from netwatch import explain_unconfirmed
+        analyzer = NetworkAnalyzer(dict(started=0.),now=0.)
+        analyzer.dns_event(100.,'discord.gg',1,0,True,['162.159.133.234'])
+        verifier = DNSVerifier()
+        self.addCleanup(verifier.close)
+        item = dict(kind='destinazione',key='162.159.133.234:443',evidence=['periodica'])
+        explain_unconfirmed([item],analyzer,({'discord.gg'},set()),verifier)
+        self.assertIn('riconferma DNS in corso',item['evidence'][-1])
+        answer = [(socket.AF_INET,socket.SOCK_STREAM,6,'',('162.159.130.234',0))]
+        with patch('netwatch.socket.getaddrinfo',return_value=answer):
+            verifier.resolve('discord.gg')
+        item['evidence'] = ['periodica']
+        explain_unconfirmed([item],analyzer,({'discord.gg'},set()),verifier)
+        self.assertIn('non compare tra i 1 indirizzi',item['evidence'][-1])
+        other = dict(kind='destinazione',key='192.0.2.1:443',evidence=[])
+        explain_unconfirmed([other],analyzer,({'discord.gg'},set()),verifier)
+        self.assertEqual(other['evidence'],[])  # names not on the list get no note
+
+
+class VerifierQueueTests(unittest.TestCase):
+    def test_observed_name_is_not_starved_by_a_sweep_of_listed_domains(self):
+        verifier = DNSVerifier()
+        self.addCleanup(verifier.close)
+        def resolve(name,*args):
+            ip = '162.159.133.234' if name.startswith('gateway') else '192.0.2.9'
+            return [(socket.AF_INET,socket.SOCK_STREAM,6,'',(ip,0))]
+        with patch('netwatch.socket.getaddrinfo',side_effect=resolve):
+            for i in range(106):  # an unnamed destination checked against every listed domain
+                verifier.matches(f'domain{i}.example','198.51.100.1')
+            verifier.matches('gateway-us-east1-b.discord.gg','162.159.133.234')
+            for _ in range(200):
+                if verifier.matches('gateway-us-east1-b.discord.gg','162.159.133.234'):
+                    break
+                time.sleep(.01)
+        self.assertTrue(verifier.matches('gateway-us-east1-b.discord.gg','162.159.133.234'))
+        self.assertEqual(len(verifier.workers),DNSVerifier.WORKERS)
+
+
+class ExecutablePathTests(unittest.TestCase):
+    def test_socket_owner_reports_the_executable(self):
+        from netwatch import socket_owner
+        server = socket.socket(); server.bind(('127.0.0.1',0)); server.listen()
+        self.addCleanup(server.close)
+        inode = os.fstat(server.fileno()).st_ino
+        owner = socket_owner(os.getpid(),server.fileno(),inode)
+        self.assertEqual(owner['exe'],os.path.realpath(sys.executable))

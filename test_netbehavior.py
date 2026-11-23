@@ -1,6 +1,7 @@
 import random
 import unittest
-from netbehavior import NetworkAnalyzer, IsolationForest, beacon, dga_likeness, noisy_or, registered
+from netbehavior import (NetworkAnalyzer, IsolationForest, WINDOW, MAX_IDN_CONTACTS,
+                         beacon, dga_likeness, noisy_or, registered)
 
 DAY = 86400
 NOW = 1_800_000_000.
@@ -107,6 +108,115 @@ class DnsTests(unittest.TestCase):
             analyzer.dns_event(NOW-600+i*10,f'img{i}.static.cdn-example.com',1,0,False)
         self.assertIsNone(top(analyzer.analyze(NOW),'tunnel'))
         self.assertEqual(registered('a.b.example.co.uk'),'example.co.uk')
+
+
+class InternationalDomainTests(unittest.TestCase):
+    def contacted(self,name):
+        analyzer = NetworkAnalyzer(now=NOW-10)
+        analyzer.dns_event(NOW-2,name,1,0,True,['203.0.113.9'])
+        analyzer.syn(NOW-1,'203.0.113.9',443)
+        return analyzer
+
+    def test_unicode_and_punycode_in_any_label_including_suffix_alert_on_contact(self):
+        for name,visible,codepoint in (
+                ('bücher.example','bücher.example','U+00FC'),
+                ('xn--bcher-kva.example','bücher.example','U+00FC'),
+                ('api.xn--bcher-kva.example','api.bücher.example','U+00FC'),
+                ('shop.xn--p1ai','shop.рф','U+0440'),
+                ('shop.рф','shop.рф','U+0440')):
+            with self.subTest(name=name):
+                analyzer = self.contacted(name)
+                analyzer.processes['203.0.113.9:443'] = 'browser (PID 42)'
+                result = top(analyzer.analyze(NOW),'idn')
+                self.assertEqual(result['key'],'203.0.113.9:443')
+                self.assertEqual(result['score'],70)
+                self.assertEqual(result['indicators'],['idn'])
+                self.assertEqual(result['process'],'browser (PID 42)')
+                self.assertNotIn('203.0.113.9',result['subject'])
+                self.assertTrue(result['subject'].isascii())
+                self.assertIn(visible,' '.join(result['evidence']))
+                self.assertIn(codepoint,' '.join(result['evidence']))
+
+    def test_ascii_digits_hyphens_and_punycode_text_inside_a_label_do_not_alert(self):
+        for name in ('api-2.example.com','mirror01.example.net','prefix-xn--test.example'):
+            with self.subTest(name=name):
+                self.assertIsNone(top(self.contacted(name).analyze(NOW),'idn'))
+
+    def test_invalid_punycode_still_alerts_and_escapes_bidi_and_controls(self):
+        for name in ('xn--.example','shop\u202e\u0001.example',
+                     'xn--'+'shop\u202e'.encode('punycode').decode('ascii')+'.example'):
+            with self.subTest(name=repr(name)):
+                result = top(self.contacted(name).analyze(NOW),'idn')
+                self.assertIsNotNone(result)
+                rendered = result['subject']+' '.join(result['evidence'])
+                self.assertNotIn('\u202e',rendered)
+                self.assertNotIn('\u0001',rendered)
+                self.assertIn('non decodificabili',rendered)
+                if name != 'xn--.example':
+                    self.assertIn('U+202E',rendered)
+                    self.assertIn('\\u202e',rendered)
+
+    def test_lookup_without_connection_or_dns_seen_after_contact_does_not_alert(self):
+        analyzer = NetworkAnalyzer(now=NOW-10)
+        analyzer.syn(NOW-5,'203.0.113.9',443)
+        analyzer.dns_event(NOW-2,'xn--bcher-kva.example',1,0,True,['203.0.113.9'])
+        self.assertIsNone(top(analyzer.analyze(NOW),'idn'))
+
+    def test_stale_failed_query_and_ptr_dns_do_not_name_a_contact(self):
+        for age,rcode,response,qtype in ((301,0,True,1),(2,3,True,1),(2,0,False,1),(2,0,True,12)):
+            with self.subTest(age=age,rcode=rcode,response=response,qtype=qtype):
+                analyzer = NetworkAnalyzer(now=NOW-1000)
+                analyzer.dns_event(NOW-age,'xn--bcher-kva.example',qtype,rcode,response,['203.0.113.9'])
+                analyzer.syn(NOW,'203.0.113.9',443)
+                self.assertIsNone(top(analyzer.analyze(NOW),'idn'))
+                if not response or rcode or qtype == 12:
+                    self.assertNotIn('203.0.113.9',analyzer.ip_domain)
+
+    def test_recorded_contact_survives_later_dns_mapping_overwrite(self):
+        analyzer = self.contacted('xn--bcher-kva.example')
+        analyzer.dns_event(NOW,'ordinary.example',1,0,True,['203.0.113.9'])
+        result = top(analyzer.analyze(NOW+1),'idn')
+        self.assertEqual(result['subject'],'xn--bcher-kva.example')
+        self.assertEqual(result['when'],NOW-1)
+
+    def test_active_snapshot_records_contact_without_a_captured_syn(self):
+        analyzer = NetworkAnalyzer(now=NOW-10)
+        analyzer.dns_event(NOW-2,'xn--bcher-kva.example',1,0,True,['203.0.113.9'])
+        flow = [('10.0.0.2',50000,'203.0.113.9',443,0,0)]
+        analyzer.snapshot(NOW-1,flow)
+        self.assertIsNotNone(top(analyzer.analyze(NOW),'idn'))
+        self.assertFalse(analyzer.events)  # no send burst or SYN was needed to establish the contact
+
+    def test_contact_expiry_and_bounded_history(self):
+        analyzer = self.contacted('xn--bcher-kva.example')
+        self.assertIsNone(top(analyzer.analyze(NOW-1+WINDOW),'idn'))
+        self.assertFalse(analyzer.idn_contacts)
+        for index in range(MAX_IDN_CONTACTS+2):
+            name = f'{index}.xn--bcher-kva.example'
+            analyzer.dns_event(NOW,name,1,0,True,['203.0.113.9'])
+            analyzer.syn(NOW,'203.0.113.9',443)
+        self.assertEqual(len(analyzer.idn_contacts),MAX_IDN_CONTACTS)
+        self.assertNotIn(('203.0.113.9:443','0.xn--bcher-kva.example'),analyzer.idn_contacts)
+
+    def test_idn_caution_does_not_change_behavioral_score(self):
+        ordinary,international = NetworkAnalyzer(now=NOW-4000),NetworkAnalyzer(now=NOW-4000)
+        for analyzer,name in ((ordinary,'ordinary.example'),(international,'xn--bcher-kva.example')):
+            for index in range(30):
+                stamp = NOW-3000+index*60
+                analyzer.dns_event(stamp-1,name,1,0,True,['203.0.113.9'])
+                analyzer.syn(stamp,'203.0.113.9',443)
+        plain = top(ordinary.analyze(NOW),'destinazione')
+        results = international.analyze(NOW)
+        self.assertEqual(plain['score'],top(results,'destinazione')['score'])
+        self.assertEqual(top(results,'idn')['score'],70)
+
+    def test_unusual_names_cannot_overflow_published_evidence_fields(self):
+        name = ''.join(chr(0x400+index) for index in range(100))+'.example'
+        result = top(self.contacted(name).analyze(NOW),'idn')
+        self.assertLess(len(result['subject']),2000)
+        self.assertTrue(all(len(line) < 2000 for line in result['evidence']))
+        self.assertLessEqual(len(result['evidence']),30)
+        self.assertIn('altri',' '.join(result['evidence']))
 
 
 class VolumeAndForestTests(unittest.TestCase):

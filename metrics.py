@@ -1,6 +1,7 @@
 """Linux counters and identity-checked process termination. Root work happens only in the separate rootservice."""
 from pathlib import Path
 import json
+import math
 import re
 import os
 import stat
@@ -33,8 +34,7 @@ def root_state(path=ROOT_STATE, owner=0):
         if not valid_network(data.get('network')):
             return None
         extra = data['processes']
-        if not isinstance(extra, dict) or not all(isinstance(v, dict) and isinstance(v.get('exe'), (str, type(None)))
-                and isinstance(v.get('disk'), (int, float, type(None))) for v in extra.values()):
+        if not isinstance(extra, dict) or not all(valid_process_observation(v) for v in extra.values()):
             return None
         return data
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -48,10 +48,76 @@ def valid_network(network):
     if not isinstance(network, dict) or not isinstance(network.get('anomalies'), list) or len(network['anomalies']) > 200:
         return False
     text = lambda v: isinstance(v, str) and len(v) < 2000
+    def owners(a):
+        records = a.get('owners',[])
+        stamp = a.get('process_observed_at')
+        return isinstance(records,list) and len(records) <= 32 and (
+            stamp is None or type(stamp) in (int,float) and math.isfinite(stamp) and stamp > 0) and all(
+            isinstance(o,dict) and type(o.get('pid')) is int and o['pid'] > 0
+            and type(o.get('created')) in (int,float) and math.isfinite(o['created']) and o['created'] > 0
+            and text(o.get('name')) and (o.get('exe') is None or isinstance(o['exe'],str) and len(o['exe']) <= 4096)
+            and type(o.get('socket_inode')) is int and o['socket_inode'] > 0
+            and type(o.get('fd')) is int and o['fd'] >= 0 for o in records)
     return all(isinstance(a, dict) and text(a.get('subject')) and text(a.get('kind'))
                and isinstance(a.get('score'), (int, float)) and 0 <= a['score'] <= 100
                and isinstance(a.get('evidence'), list) and len(a['evidence']) <= 30 and all(text(e) for e in a['evidence'])
-               and (a.get('process') is None or text(a['process'])) for a in network['anomalies'])
+               and (a.get('process') is None or text(a['process'])) and owners(a) for a in network['anomalies'])
+
+
+def compatible_image(local,observed):
+    """Independent scanners can compare image observations, not their local generation numbers."""
+    if not isinstance(observed,dict):
+        return False
+    for key in ('boot_id','start_ticks','image_fingerprint','name'):
+        if local.get(key) is not None and observed.get(key) is not None and local[key] != observed[key]:
+            return False
+    return not (local.get('cmdline') and observed.get('cmdline') and local['cmdline'] != observed['cmdline'])
+
+
+def compatible_finding(local,observed):
+    if not isinstance(observed,dict) or not all(observed.get(k) is not None for k in ('boot_id','start_ticks','name')):
+        return False
+    return compatible_image(local,observed)
+
+
+def valid_process_observation(row):
+    if not isinstance(row,dict) or not isinstance(row.get('exe'),(str,type(None))):
+        return False
+    number = lambda v: type(v) in (int,float) and math.isfinite(v) and v >= 0
+    if row.get('disk') is not None and not number(row['disk']):
+        return False
+    if 'boot_id' not in row:
+        return True  # compatible file format; these older extras are not merged
+    integers = ('pid','start_ticks','ppid','memory','threads','exec_generation')
+    if not all(type(row.get(k)) is int and row[k] >= 0 for k in integers):
+        return False
+    if not isinstance(row['boot_id'],str) or not row['boot_id'] or len(row['boot_id']) > 128:
+        return False
+    if not all(number(row.get(k)) for k in ('created','observed_at')):
+        return False
+    if not all(k in row and (row[k] is None or number(row[k])) for k in
+               ('cpu','disk','cpu_cores','io_read','io_write','io_read_bytes','io_write_bytes','uid')):
+        return False
+    if not all(isinstance(row.get(k),str) for k in ('name','user','status')):
+        return False
+    if not isinstance(row.get('cmdline'),list) or not all(isinstance(v,str) for v in row['cmdline']):
+        return False
+    fingerprint = row.get('image_fingerprint')
+    return fingerprint is None or isinstance(fingerprint,str) and re.fullmatch('[0-9a-f]{64}',fingerprint) is not None
+
+
+def root_process_row(local,observed):
+    """Use an entire root sample only when its lifetime and observable image still match."""
+    if not valid_process_observation(observed) or not observed.get('boot_id') or not observed.get('start_ticks'):
+        return None  # an older service cannot identify exec generations safely
+    required = ('pid','created','boot_id','start_ticks')
+    if any(local.get(k) != observed.get(k) for k in required) or not compatible_image(local,observed):
+        return None
+    fields = ('name','exe','cmdline','uid','user','ppid','status','memory','threads','cpu','disk',
+              'cpu_cores','io_read','io_write','io_read_bytes','io_write_bytes','exec_generation','image_fingerprint','observed_at')
+    if not all(k in observed for k in fields):
+        return None
+    return {k:observed[k] for k in (*required,*fields)}
 
 
 def rate(current, previous, elapsed):
@@ -162,7 +228,7 @@ class Monitor:
         self.detector = Detector()
         try:
             # The proc connector accepts unprivileged listeners on this kernel; without it, 1 s sampling still applies.
-            self.exec_watcher = ExecWatcher(self.detector)
+            self.exec_watcher = ExecWatcher(self.detector,on_exec=self.scanner.exec_seen)
             if self.detector.traps:
                 self.detector.traps.lookup = self.exec_watcher.recent_description
             self.exec_watcher.start()
@@ -220,10 +286,13 @@ class Monitor:
             self.detector.close()
             for row in rows:
                 extra = state['processes'].get(f"{row['pid']}:{row['created']!r}")
-                if extra:
-                    row['exe'] = row['exe'] or extra['exe']
-                    row['disk'] = row['disk'] if row['disk'] is not None else extra['disk']
-            result['threats'], result['protection'], result['network'] = state['threats'], 'root', state.get('network')
+                observed = root_process_row(row,extra)
+                if observed:
+                    row.update(observed)
+            current = {(r['pid'],r['created']):r for r in rows}
+            findings = [f for f in state['threats']['processes'] if (f['pid'],f['created']) in current
+                        and compatible_finding(current[(f['pid'],f['created'])],f.get('image'))]
+            result['threats'], result['protection'], result['network'] = dict(state['threats'],processes=findings), 'root', state.get('network')
         else:
             result['threats'], result['protection'], result['network'] = self.detector.assess(rows,cores), 'utente', None
         result['root_available'] = ROOT_TERMINATE.exists()

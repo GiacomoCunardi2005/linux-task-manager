@@ -18,6 +18,8 @@ User explicitly requires the original positions, information hierarchy, graphs a
 
 ## Root service and autostart
 
+The root service also observes bursts of changes in existing XDG personal folders using fanotify directory marks and PIDFD attribution. Distinct files are counted across renames for currently active PID/start-time identities. Initial thresholds are 30 files/15 seconds for medium risk, and 100 files including 20 renames/deletions for high risk. Observation only; no automatic process action. Coverage and limits are shown in process anomalies and the footer tooltip.
+
 The GUI never runs as root (user decision delegated to the developer: safer and Wayland-compatible). An optional systemd system service (rootservice.py, installed root-owned in /opt by install-root-service.sh) gives full visibility: all processes' executables, disk I/O and sockets, fanotify attribution of trap access, root crontab. It writes a root-owned 0640 state file the app trusts only when fresh. Its ignore list lives in /etc so user-level malware cannot silence it. Stopping other users' processes uses pkexec with an identity-checked helper; there is no standing command channel. The headless remote server was removed at the user's request. The app autostarts at login in the tray and quits cleanly on SIGTERM so traps are removed.
 
 Connection topology includes USB root hubs, intermediate hubs and peripherals even without storage/network interfaces, plus actual USB4/Thunderbolt routers exposed by the kernel. It is read-only, includes negotiated link speeds, and separates host capabilities/declared USB versions from actual external links. Parent relationships are taken from sysfs, never inferred from connector shapes, bus numbers or marketing names.

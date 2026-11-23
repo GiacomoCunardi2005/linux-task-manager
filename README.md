@@ -2,13 +2,26 @@
 
 App desktop Python + Qt che riprende disposizione, grafici e colori delle schede **Processi** e **Prestazioni** di Gestione attività di Windows 11. Prima versione sviluppata e verificata su CachyOS con GNOME/Wayland, con dati reali di questo computer.
 
-## Avvio
+## Installazione (qualsiasi distribuzione)
+
+Scarica l’archivio dell’ultima versione dalla pagina [Releases](https://github.com/GiacomoCunardi2005/linux-task-manager/releases), estrailo ed esegui l’installatore come utente normale:
 
 ```bash
-git clone https://github.com/GiacomoCunardi2005/linux-task-manager.git
-cd linux-task-manager
-./start.sh
+tar xf linux-task-manager-*.tar.gz
+cd linux-task-manager-*/
+./install.sh
 ```
+
+L’installatore riconosce il gestore di pacchetti (pacman, apt, dnf, zypper, xbps), installa con sudo Python, venv/pip, le librerie che servono a Qt e gli strumenti `ss` e polkit, copia l’app in `~/.local/share/linux-task-manager`, prepara l’ambiente Python e aggiunge la voce nel menu con l’avvio al login nell’area di notifica. Opzioni:
+
+- `./install.sh --root-service` installa anche il servizio root (rilevamento completo, trappole, analisi di rete);
+- `./install.sh --no-autostart` non avvia l’app al login;
+- `./install.sh --no-deps` non installa pacchetti di sistema;
+- `./install.sh --uninstall` rimuove app e servizio root.
+
+Requisiti: Linux con glibc (Alpine/musl non è supportato da Qt), Python ≥ 3.10 (con 3.10 i controlli sulle impostazioni di Codex sono saltati), un desktop X11 o Wayland. Le funzioni del kernel usate dal servizio root (fanotify, proc connector, sock_diag, BPF) sono presenti nei kernel Linux moderni; se una manca, quella funzione si disattiva e il resto continua: lo stato di ciascuna è indicato nell’app. Verificato con installazioni pulite su Debian 12, Ubuntu 22.04 e 24.04 (quindi anche Linux Mint 21 e 22), Fedora 41 e su CachyOS.
+
+Per provarla senza installare, dalla cartella del progetto: `./start.sh`.
 
 Il primo avvio crea un ambiente Python locale e installa Qt Essentials e psutil, se mancanti. Non richiede root. Su altre distribuzioni servono Python 3 con venv/pip e le librerie di sistema per Qt/Wayland o X11. Su Arch/CachyOS i prerequisiti sono `python`, `python-pip` e le normali librerie del desktop. L’app non apre porte di rete. Il servizio root è separato e opzionale.
 
@@ -66,6 +79,8 @@ Le voci raggruppano processi dello stesso utente con lo stesso nome di eseguibil
 
 La rete per processo usa il comando opzionale [NetHogs](https://github.com/raboof/nethogs), già funzionante con i permessi di cattura su questo computer. Un sottoprocesso legge contatori TCP e UDP; l’app grafica rimane senza privilegi e non configura capabilities né esegue sudo. Il collector si arresta alla chiusura e si riavvia se cambiano le interfacce. Mancanza del programma, permessi insufficienti, contatori iniziali o scaduti producono N/D. I contatori sono associati a PID + data di creazione: PID riutilizzati non ereditano il traffico. Connessioni/pacchetti non attribuiti da NetHogs possono mancare; il totale delle interfacce in testata non deve coincidere con la somma delle righe. I nuovi processi hanno CPU e I/O N/D fino al secondo campione.
 
+Quando un processo cambia programma tramite `exec`, PID e data di avvio possono restare uguali. Il campionatore verifica anche eseguibile, argomenti e credenziali; gli eventi di exec invalidano la cache anche se questi metadati restano identici. Una nuova immagine azzera le velocità CPU/I/O e la storia del rilevamento CPU. Un cambiamento durante la lettura fa saltare il campione. Il servizio root pubblica osservazioni complete con boot ID, start tick e identità dell'immagine: l’app scarta quelle incompatibili con ciò che vede, evitando di unire dati di programmi diversi. I contatori interni espongono anche CPU in core equivalenti, thread e I/O lettura/scrittura separati.
+
 Su Intel, fdinfo comprende soltanto i client leggibili dall'utente e può sottostimare l'utilizzo totale della GPU; un dato mancante è indicato come non disponibile. Le GPU sono identificate per produttore. AMD e NVIDIA e le altre distribuzioni non sono state provate su hardware reale. Le metriche specifiche di Windows non hanno sempre un equivalente Linux: i file allocati del kernel sostituiscono gli handle; la virtualizzazione indica il supporto CPU. Capacità espresse in potenze di 1024, come nel riferimento Windows. Dischi, interfacce di rete, GPU e NPU vengono rilevati a ogni campione: non occorre riaprire l’app. Le cronologie vengono eliminate quando un dispositivo è rimosso o sostituito; il primo campione di un nuovo disco o NPU non inventa un utilizzo pari a zero.
 
 La somiglianza visiva è una ricostruzione, non una corrispondenza pixel per pixel: i font disponibili e alcuni dati Linux differiscono. Se Segoe UI non è installato viene usato Noto Sans. Nessun font o asset Microsoft viene redistribuito. Il riferimento visivo di Prestazioni è la [guida TechRadar](https://www.techradar.com/how-to/how-to-use-the-redesigned-task-manager-in-windows-11s-2022-update).
@@ -74,7 +89,7 @@ La somiglianza visiva è una ricostruzione, non una corrispondenza pixel per pix
 
 La pagina Processi segnala in **Stato** i processi «Sospetto» (rischio alto) o «Da verificare» (rischio medio); il tooltip spiega il motivo. Scrivere «sospetto» nella ricerca mostra solo quelli. La riga in fondo riassume processi e avvisi di sistema; il suo tooltip elenca gli avvisi di sistema. Sono segnali euristici sui dati già raccolti, **non un antivirus**: non analizzano il contenuto dei file e non chiudono nulla da soli.
 
-Il pulsante **Anomalie dei processi** mostra un riepilogo dei singoli processi segnalati, con PID, utente, livello e motivi; il numero sul pulsante indica quanti sono. La finestra mostra i dati del momento in cui viene aperta. Gli avvisi di sistema restano nel riepilogo in fondo alla pagina e le anomalie di rete nella loro finestra dedicata.
+Il pulsante **Anomalie dei processi** mostra i processi segnalati, con PID, utente, livello e motivi, e gli avvisi di sistema con i rispettivi motivi; il numero sul pulsante conta entrambi. La finestra mostra i dati del momento in cui viene aperta. Le anomalie di rete restano consultabili anche nella loro finestra dedicata.
 
 Controlli sui processi:
 - nome da thread del kernel (`kworker`, `kthreadd`…) in un processo che non discende da kthreadd: funziona anche per i processi di altri utenti, perché usa solo nome e PID padre;
@@ -96,6 +111,14 @@ All’avvio vengono creati **file trappola** (honeyfile o canary file) con nomi 
 - Alla chiusura dell’app o del servizio le trappole vengono eliminate. Dopo un arresto anomalo vengono rimosse al successivo avvio grazie al registro in `~/.cache/linux-task-manager/traps/` (servizio root: `/var/lib/linux-task-manager/traps/`); si cancella solo un file normale del proprio utente che inizia con l’intestazione della trappola.
 - Possono far scattare le trappole: antivirus, programmi di **backup** o sincronizzazione della home, comandi come `grep -r ~` e programmi di pulizia. Con il servizio root, se il processo che le apre ha un nome presente nella lista delle eccezioni (per esempio `deja-dup`), l’accesso non viene segnalato. Per disattivare le trappole aggiungere la riga `trappole` alla lista delle eccezioni.
 
+### Modifiche massive ai file (servizio root)
+
+Il servizio root osserva modifiche, rinomine ed eliminazioni nelle cartelle personali configurate da XDG: Documenti, Scrivania, Scaricati, Immagini, Musica e Video, quando esistono. La sorveglianza è ricorsiva e usa eventi fanotify con identità del file e PIDFD. Conta oggetti distinti anche dopo una rinomina, verifica che il processo sia ancora attivo e associa l'attività a PID e data di avvio. Non legge il contenuto dei file. I collegamenti simbolici alle sottocartelle non vengono seguiti; rinomine o eliminazioni di oggetti diversi da directory, inclusi collegamenti simbolici, possono entrare nel conteggio.
+
+Le soglie iniziali sono **30 file distinti in 15 secondi** per «Da verificare» e **100 file distinti**, di cui almeno 20 rinominati o eliminati, per «Sospetto». Le sole scritture restano un segnale medio. Il motivo riporta conteggi e fino a tre cartelle coinvolte nella finestra osservata; le soglie sono euristiche, non una prova di ransomware. Backup, sincronizzazioni e cifratura legittima possono produrre gli stessi segnali. Si applicano le eccezioni per nome o percorso dell'eseguibile di `/etc/linux-task-manager/ignore.txt`. Il controllo non sospende né termina automaticamente i processi. La notifica viene ripetuta se l'avviso scompare e ritorna o aumenta di livello, non per ogni variazione del conteggio.
+
+Lo stato compare nella finestra **Anomalie dei processi**; il tooltip del riepilogo in fondo alla pagina mostra cartelle, errori ed eventi non attribuiti. Un kernel o filesystem senza le funzioni richieste lascia il controllo non disponibile, mantenendo gli altri controlli. Sono limitati i mark delle cartelle, la scansione iniziale e i dati conservati: raggiungere un limite o perdere eventi indica copertura parziale. La scoperta di nuove sottocartelle non è atomica e può perdere operazioni iniziali; fanotify non vede tutte le scritture tramite `mmap`/`msync`. Gli eventi non hanno un timestamp individuale del kernel: la finestra usa il tempo di raccolta e la coda viene letta anche durante la scansione. I processi già terminati o con identità incerta non ricevono un'attribuzione inventata. Gli avvisi scadono con la finestra di osservazione.
+
 ### Estensioni degli agenti AI (Claude Code, Codex)
 
 Hook, skill, plugin e server MCP degli agenti di programmazione sono codice che gira con i tuoi permessi, a volte prima che il modello o tu ve ne accorgiate. Ogni 5 minuti (rileggendo solo i file cambiati) vengono controllati:
@@ -110,11 +133,17 @@ Viene salvata un’impronta di ogni hook, server MCP e comando dinamico (`~/.cac
 
 ### Anomalie di rete (servizio root)
 
-Il servizio root osserva **solo il comportamento** delle comunicazioni: nessun elenco di server malevoli, nessuna firma, nessun modello addestrato su malware. Ogni comunicazione riceve un **punteggio 0–100** che combina indicatori indipendenti (un indicatore da solo resta basso; più indicatori insieme lo alzano). Il pulsante **Anomalie di rete** della pagina Processi mostra la classifica con le evidenze di ogni voce; solo i punteggi da 70 in su diventano avvisi («Da verificare», da 90 «Sospetto»). È un elenco di ciò che merita uno sguardo, non una diagnosi.
+Il servizio root osserva **il comportamento** delle comunicazioni e controlla i nomi internazionalizzati contattati: nessun elenco di server malevoli, nessuna firma, nessun modello addestrato su malware. Ogni comunicazione riceve un **punteggio 0–100** che combina indicatori indipendenti (un indicatore da solo resta basso; più indicatori insieme lo alzano). Il pulsante **Anomalie di rete** della pagina Processi mostra la classifica con le evidenze di ogni voce; solo i punteggi da 70 in su diventano avvisi («Da verificare», da 90 «Sospetto»). È un elenco di ciò che merita uno sguardo, non una diagnosi. Quando manca il nome osservato, viene tentata in background una ricerca DNS inversa: il risultato è indicato come «da verificare» e non viene usato per applicare le eccezioni. Può indicare un provider o un server condiviso invece del servizio effettivamente contattato; se la ricerca non produce un nome, la destinazione resta non identificata.
 
-Le eccezioni delle destinazioni si configurano in `/etc/linux-task-manager/network-ignore.txt`, installato dal servizio senza sovrascrivere un file già presente. Una riga può contenere un dominio (inclusi i suoi sottodomini) oppure un indirizzo IP esatto; `#` introduce un commento. Le modifiche vengono rilette all'analisi successiva, entro circa 30 secondi. Le destinazioni corrispondenti non compaiono nella classifica né generano il relativo avviso; gli indicatori aggregati del dispositivo e i controlli DNS continuano a essere calcolati. Il riconoscimento di un dominio dipende dalle risposte DNS osservate negli ultimi 5 minuti: DNS cifrato o non osservato può impedirlo e IP condivisi possono essere associati al nome sbagliato. Un dominio noto non rende automaticamente sicuro il traffico: rimuovere un'eccezione se si desidera continuare a controllarlo.
+I domini contattati con lettere non ASCII o etichette Punycode (`xn--`), anche nel suffisso finale, producono un avviso **Dominio IDN** da verificare (punteggio fisso 70), indipendente dal punteggio comportamentale. I dettagli riportano nome Unicode, forma codificata e codici dei caratteri. È una regola sul nome, non una prova di phishing: molti domini internazionalizzati sono legittimi. Una sola ricerca DNS non basta: occorre anche una connessione TCP osservata o un socket TCP attivo, associato a una risposta DNS riuscita degli ultimi 5 minuti. I nomi di DNS inverso non attivano questa regola. Il controllo non può identificare nomi nascosti da DNS cifrato o mai osservati; le eccezioni delle destinazioni non sopprimono questo avviso.
+
+Le eccezioni delle destinazioni si configurano in `/etc/linux-task-manager/network-ignore.txt`, installato dal servizio senza sovrascrivere un file già presente. Una riga può contenere un dominio (inclusi i suoi sottodomini) oppure un indirizzo IP esatto; `#` introduce un commento. Le modifiche vengono rilette all'analisi successiva, entro circa 30 secondi. Le destinazioni corrispondenti non compaiono nella classifica né generano il relativo avviso; gli indicatori aggregati del dispositivo e i controlli DNS continuano a essere calcolati. Quando il nome osservato appartiene alla lista ma la sua associazione DNS è più vecchia di 5 minuti, il servizio risolve nuovamente quel nome in background: se l'IP è ancora confermato, applica l'eccezione all'analisi successiva. Le conferme scadono dopo 5 minuti e vengono rinnovate in anticipo. Poiché GitHub, Google, Cloudflare e molte CDN rispondono ogni volta con un sottoinsieme diverso dei propri server, gli indirizzi confermati per un nome consentito vengono ricordati per 6 ore: una connessione lunga non ricompare solo perché l'ultima risposta elencava altri server. Un errore DNS cancella questa memoria e lascia visibile la destinazione. Inoltre ogni connessione viene associata al nome con cui il suo indirizzo è stato risolto nelle 2 ore precedenti: con `nss-resolve` i programmi interrogano systemd-resolved tramite il suo canale locale e le risposte dalla cache non producono pacchetti DNS, quindi conta l'ultima risposta osservata dal server esterno. Se tutte le connessioni a una destinazione hanno nomi consentiti, l'eccezione resta valida anche se il nome in seguito si risolve altrove; una connessione verso un indirizzo mai visto nel DNS nelle ultime 2 ore, o con un nome non consentito, la lascia visibile. Esempio: il controllo di connettività di NetworkManager contatta ogni 5 minuti `ping.archlinux.org` (alias di `redirect.archlinux.org`) e rientra nell'eccezione `archlinux.org`. Se il nome non è stato osservato, il servizio risolve in background i nomi esplicitamente presenti nella lista e confronta gli indirizzi ottenuti: per esempio `gew4-dealer-ssl.spotify.com`, senza fissare il suo IP. I sottodomini non elencati non possono essere indovinati. La risoluzione può richiedere più cicli e, se fallisce, la voce resta visibile. Un IP condiviso può appartenere anche ad altri servizi: questa corrispondenza non prova quale sia stato effettivamente contattato e l'eccezione può nascondere anche altre comunicazioni allo stesso indirizzo. Un dominio noto non rende automaticamente sicuro il traffico: rimuovere un'eccezione se si desidera continuare a controllarlo.
 
 Fonti, tutte dal kernel e senza leggere contenuti: cattura filtrata con BPF dei soli pacchetti DNS e degli avvii di connessione TCP (orari esatti del kernel); eventi di chiusura dei socket (`sock_diag`) con i byte finali di ogni connessione, anche se dura 200 ms; contatori di `ss` ogni 5 secondi per le connessioni lunghe; `loginctl` per sapere se l’utente è inattivo.
+
+I volumi includono anche i socket ancora aperti. La tupla di connessione e il cookie del kernel separano i socket: ogni snapshot aggiunge un delta e la chiusura aggiunge solo il residuo, senza ricontare il totale. Se il SYN è stato osservato si conta anche il primo totale; per una connessione già aperta all’avvio il primo contatore disponibile di ciascuna direzione stabilisce il riferimento. Contatori o durate mancanti restano sconosciuti e i vettori incompleti non entrano nell’Isolation Forest. Lo stato dei socket è limitato a 20.000 record; un totale finale che potrebbe riferirsi a uno stato perso viene omesso conservativamente. Socket scomparsi dagli snapshot restano riconoscibili per sei ore, quelli già chiusi per la finestra di analisi più dieci minuti.
+
+L’attribuzione del processo usa un nuovo snapshot `ss` a ogni analisi, per un massimo di dieci destinazioni con punteggio almeno 40. Verifica inode e descrittore del socket, identità di avvio e processo ancora vivo tramite PIDFD; esporta anche l’istante della verifica e i proprietari condivisi. Se il socket è già chiuso o la verifica fallisce, il processo resta sconosciuto: i vecchi nomi non vengono conservati in cache.
 
 Indicatori:
 - **Beaconing**: contatti a intervalli regolari verso la stessa destinazione, tollerando jitter e battiti mancati; contano la regolarità e il coefficiente di variazione degli intervalli (il traffico casuale ha CV intorno a 0,27, un beacon sotto 0,2), dimensioni quasi costanti, persistenza nelle ore, richiesta DNS prima di ogni connessione. Vale anche per i «battiti» dentro una sola connessione lunga. Un ritmo presente da più di 3 giorni (posta, sincronizzazione, chat) è considerato un’abitudine e pesa molto meno.
@@ -127,6 +156,17 @@ Indicatori:
 
 La baseline locale (destinazioni, domini, ritmi abituali, storia del dispositivo, profili per l’Isolation Forest) è in `/var/lib/linux-task-manager/network.json`; le prime 24 ore servono a costruirla. Il processo responsabile viene cercato solo per le voci con punteggio da 40 in su. Limiti: DNS cifrato (DoH/DoT) e traffico QUIC/UDP non sono visibili; il contenuto cifrato non viene letto; un malware che imita perfettamente il traffico abituale può passare inosservato; anche programmi legittimi possono essere periodici o inviare molti dati, per questo conta la combinazione di indicatori. Le prove simulate tengono il traffico di navigazione casuale sotto 40 e un beacon C2 nuovo sopra 90.
 
+### Programmi Windows sotto Wine e Proton
+
+Wine non è una sandbox: un programma Windows gira con i permessi dell’utente e attraverso l’unità `Z:` raggiunge tutto il file system, home compresa. In uno studio del 2019 cinque campioni di malware Windows su trenta funzionavano sotto Wine. Per questo i processi avviati con Wine, Proton (anche GE-Proton), Lutris, Bottles o Steam non sono mai considerati affidabili:
+
+- gli avvisi indicano il programma Windows (`C:\Game\gioco.exe`) e non solo `wine-preloader`;
+- un eseguibile Windows avviato da `Temp`, `AppData\Local\Temp`, `Downloads`/`Scaricati` o `Z:\tmp` è da verificare;
+- gli strumenti di Windows usati come fanno i malware (*living off the land*, progetto LOLBAS e MITRE ATT&CK T1218) sono segnalati: PowerShell con comando codificato, nascosto o che scarica ed esegue codice, `mshta` e `rundll32` con URL o `javascript:`, `regsvr32 /i:http` (Squiblydoo), `certutil -urlcache`/`-decode`, `bitsadmin /transfer`, `wscript`/`cscript` con script, `schtasks /create` e `reg add …\Run`;
+- **persistenza nei prefissi**: wineboot esegue senza chiedere i programmi nelle chiavi `Run`, `RunOnce`, `RunServices` (anche `Wow6432Node` e criteri) di `user.reg`/`system.reg` e nelle cartelle Esecuzione automatica di `drive_c`, come Windows all’accesso. Ogni voce viene segnalata, tranne `winemenubuilder.exe` che Wine crea in ogni prefisso; rischio alto se parte da una cartella temporanea o usa uno degli strumenti sopra.
+
+I prefissi vengono trovati nelle posizioni note (`~/.wine`, Steam/Proton `compatdata/*/pfx`, Lutris, Heroic, Bottles), dalla variabile `WINEPREFIX` dei processi Wine in esecuzione e con una ricerca ogni ora nella home (anche sandbox come `~/.cache/...`). La riga `wine` nella lista delle eccezioni disattiva questi controlli; si possono escludere anche un prefisso o il nome di una voce.
+
 ### Processi di breve durata
 
 Il kernel avvisa a ogni avvio di programma (proc connector), quindi anche i processi che durano meno del campionamento di 1 secondo vengono controllati: l’app legge `/proc` subito dopo l’avvio e un processo terminato in un millisecondo con un eseguibile in `/dev/shm` viene comunque segnalato. Su questo kernel funziona anche senza root; per i processi di altri utenti senza servizio root l’eseguibile non è leggibile e valgono i controlli su nome e riga di comando. Sono controllati anche i file di avvio di sistema (`/etc/cron.d`, `/etc/crontab`, unità systemd in `/etc/systemd/system`, `/etc/xdg/autostart`, `/etc/profile.d`) e `/etc/ld.so.preload`, che carica una libreria in ogni programma ed è una tecnica tipica dei rootkit.
@@ -138,7 +178,7 @@ Limiti: senza servizio root, per i processi di altri utenti eseguibile e conness
 ## Verifica
 
 ```bash
-.venv/bin/python -m unittest -v test_metrics test_ui test_processes test_hardware test_process_network test_detection test_rootservice test_agents test_netbehavior test_netwatch
+.venv/bin/python -m unittest -v test_metrics test_ui test_processes test_hardware test_process_network test_detection test_rootservice test_agents test_netbehavior test_netwatch test_filebehavior test_filewatch test_ml_foundation
 ```
 
 Test della contabilizzazione CPU, reset dei contatori, coerenza dei dati Linux e interazione delle viste Qt (risorse, pausa, processori logici, copia, finestra compatta). La cartella locale `reference/` non viene pubblicata: può contenere schermate con dati del computer e riferimenti esterni. I test UI producono schermate reali in `reference/linux-*.png` usando Qt offscreen.

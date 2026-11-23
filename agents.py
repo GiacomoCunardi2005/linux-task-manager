@@ -12,7 +12,10 @@ from pathlib import Path
 import re
 import shutil
 import time
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python 3.10: Codex settings (TOML) are skipped, the Claude checks still run
+    tomllib = None
 
 NETWORK = re.compile(r'\b(curl|wget|nc|ncat|netcat|socat|telnet|Invoke-WebRequest)\b|/dev/(tcp|udp)/')
 SECRET = re.compile(r'gh\s+auth\s+token|\.ssh/|\bid_(rsa|ed25519|ecdsa)\b|\.aws/|\.netrc|\.git-credentials|\bprintenv\b|/etc/shadow|'
@@ -58,8 +61,8 @@ class AgentScanner:
     def toml(self,path):
         text = self.text(path)
         try:
-            return tomllib.loads(text) if text else None
-        except tomllib.TOMLDecodeError:
+            return tomllib.loads(text) if text and tomllib else None
+        except (tomllib.TOMLDecodeError if tomllib else ValueError):
             return None
 
     # --- judging ---

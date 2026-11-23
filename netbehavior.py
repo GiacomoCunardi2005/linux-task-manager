@@ -1,13 +1,14 @@
-"""Behavioural network anomaly scoring: no blacklists, signatures or models trained on malware.
+"""Network anomaly scoring: local behaviour plus a separate international-domain caution.
 
-Every indicator is computed from what this machine was observed doing, against a baseline learnt locally.
-Independent indicators are combined with a noisy-OR into a 0-100 score, so one weak indicator stays low and
-several independent ones rise together. The result is a ranked list of what deserves a look, not a verdict.
+Behaviour indicators use what this machine was observed doing, against a baseline learnt locally.
+Independent behaviour indicators are combined with a noisy-OR into a 0-100 score; contacted IDN names
+produce a separate fixed caution. The result is a ranked list of what deserves a look, not a verdict.
 """
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 import math
 import statistics
 import time
+import unicodedata
 import numpy as np
 
 WINDOW = 2*3600            # behaviour window for destinations
@@ -15,10 +16,62 @@ DNS_WINDOW = 15*60          # DGA / tunnelling window
 BUCKET = 300                # device-level metric bucket (5 min)
 HISTORY_BUCKETS = 7*24*12   # one week of buckets
 LEARNING = 24*3600          # before this, "new destination" means little
+CONTACT_DNS_HORIZON = 2*3600  # systemd-resolved can serve an answer from its cache this long after the packet
+IDN_DNS_MAX_AGE = 300       # only a recent observed answer can name a contacted destination
+MAX_IDN_CONTACTS = 10000    # bounded contact history, independent of the DNS display cache
+MAX_FLOWS = 20000           # socket counters and recent close tombstones
+FLOW_GRACE = WINDOW+10*60   # keep closed identities through the feature window
+FLOW_RETENTION = 6*3600     # match the collector's retention of captured SYNs
 WEIGHTS = dict(beacon=.75,sizes=.3,persist=.2,new=.35,volume=.7,short=.35,iforest=.45,dga=.8,tunnel=.8,spike=.5,dnsfirst=.15)
 TWO_LEVEL = {'co.uk','org.uk','ac.uk','gov.uk','com.au','net.au','org.au','co.jp','ne.jp','or.jp','com.br','com.cn','net.cn',
              'co.nz','co.za','co.in','com.mx','com.tr','co.kr','com.ar','gov.it'}
 VOWELS = set('aeiouy')
+
+
+def safe_domain_text(value):
+    """Keep visible Unicode, but make invisible/control and bidi-format characters explicit."""
+    display = ''.join(f'\\u{ord(char):04x}' if unicodedata.category(char).startswith('C')
+                      or unicodedata.category(char) in ('Zl','Zp') else char for char in value)
+    return display if len(display) <= 1800 else display[:1800]+'…'
+
+
+def international_domain(name):
+    """IDN evidence for any label, including the suffix. IDN is a caution, not a malware verdict."""
+    labels = name.rstrip('.').lower().split('.')
+    if not any(ord(char) > 127 for char in name) and not any(label.startswith('xn--') for label in labels):
+        return None
+    decoded, wire, invalid = [], [], []
+    for label in labels:
+        if label.startswith('xn--'):
+            wire.append(safe_domain_text(label))
+            try:
+                decoded.append(label.encode('ascii').decode('idna'))
+            except UnicodeError:
+                try:
+                    decoded.append(label[4:].encode('ascii').decode('punycode') or label)
+                except UnicodeError:
+                    decoded.append(label)
+                invalid.append(safe_domain_text(label))
+        else:
+            decoded.append(label)
+            try:
+                wire.append(label.encode('idna').decode('ascii'))
+            except UnicodeError:
+                # Malformed labels still deserve attention. This is an escaped representation,
+                # rather than a claim that the text is a valid DNS wire name.
+                wire.append(''.join(char if 32 <= ord(char) < 127 else f'\\u{ord(char):04x}' for char in label))
+                invalid.append(safe_domain_text(label))
+    display, ascii_name = safe_domain_text('.'.join(decoded)), safe_domain_text('.'.join(wire))
+    points = dict.fromkeys(char for char in ''.join(decoded)+name if ord(char) > 127)
+    evidence = [f'Nome internazionale contattato: {display}', f'Forma DNS ASCII/Punycode: {ascii_name}']
+    if points:
+        evidence.append('Caratteri non ASCII: '+', '.join(
+            f'U+{ord(char):04X} {unicodedata.name(char,"SENZA NOME")}' for char in list(points)[:16])
+            +(f'; altri {len(points)-16} caratteri distinti' if len(points) > 16 else ''))
+    if invalid:
+        evidence.append('Etichette non decodificabili come IDNA: '+', '.join(invalid))
+    evidence.append('I domini internazionali possono essere legittimi; verificare il nome per possibili caratteri somiglianti.')
+    return dict(subject=ascii_name,evidence=[line if len(line) < 1900 else line[:1899]+'…' for line in evidence])
 
 
 def noisy_or(parts):
@@ -140,11 +193,17 @@ class NetworkAnalyzer:
         self.base.setdefault('device',{'conn':[],'dst':[],'out':[]})
         self.base.setdefault('vectors',[])
         self.events = {}             # destination key -> deque of connection/burst times
-        self.conns = deque(maxlen=20000)   # closed connections
+        self.conns = deque(maxlen=20000)   # final connection sizes and known durations
+        self.transfers = deque(maxlen=20000)  # (time, destination, uncounted TX, uncounted RX)
         self.dns = deque(maxlen=20000)
         self.ip_domain, self.dns_seen_at = {}, {}  # resolved IP -> name / time of the answer
+        self.idn_contacts = OrderedDict()  # (destination key, wire domain) -> (last contact, evidence)
         self.dns_before = {}         # destination key -> [connections preceded by a DNS answer, total]
-        self.flows = {}              # long-lived 4-tuple -> (out, in)
+        # destination key -> names answered by DNS just before each connection, and connections opened without one.
+        # Kept while the destination is active, so rotating DNS later cannot erase what was actually contacted.
+        self.contact_names = {}
+        self.flows = OrderedDict()   # (4-tuple, socket cookie) -> cumulative counters / lifecycle
+        self.flow_loss_time = float('-inf')  # totals older than an evicted state cannot safely be recounted
         self.idle = []               # (time, user idle?)
         self.bucket = (int(now//BUCKET),0,set(),0)
         self.forest, self.forest_time = None, 0.
@@ -178,40 +237,156 @@ class NetworkAnalyzer:
         if not qname or qname.endswith(('.local','.arpa','.lan','.home','.station','.internal')) or '.' not in qname:
             return
         self.dns.append((t,qname,qtype,rcode,response))
-        for ip in ips:
-            self.ip_domain[ip] = qname
-            self.dns_seen_at[ip] = t
+        if response and rcode == 0 and str(qtype) != '12':  # queries, failures and PTR are not forward identities
+            for ip in ips:
+                self.ip_domain[ip] = qname
+                self.dns_seen_at[ip] = t
         if response and rcode == 0:  # only names that exist become "known"; a failed lookup must stay unseen
             entry = self.base['domains'].setdefault(registered(qname),[t,t,0])
             entry[1], entry[2] = t, entry[2]+1
 
     def syn(self,t,dst,dport):
         key = self.key(dst,dport)
+        self.contacted_name(t,dst,key)
         self.events.setdefault(key,deque(maxlen=300)).append(t)
         entry = self.base['dest'].setdefault(key,[t,t,0])
         entry[1], entry[2] = t, entry[2]+1
         seen = self.dns_seen_at.get(dst)
+        backed = bool(seen and 0 <= t-seen < 3)
         counts = self.dns_before.setdefault(key,[0,0])
-        counts[0] += bool(seen and 0 <= t-seen < 3)
+        counts[0] += backed
         counts[1] += 1
+        record = self.contact_names.setdefault(key,dict(names=set(),unbacked=0))
+        # With nss-resolve, programs ask systemd-resolved over its own socket and cached answers send no packet:
+        # only the upstream query on a cache miss is visible. An address answered within the cache horizon names
+        # the connection; one never seen in DNS (or seen too long ago) does not.
+        cached = bool(seen is not None and 0 <= t-seen <= CONTACT_DNS_HORIZON)
+        name = self.ip_domain.get(dst) if cached else None
+        if name and len(record['names']) < 20:
+            record['names'].add(name)
+        elif not name:
+            record['unbacked'] += 1
         self.tick(t,dst)
 
-    def close(self,t,dst,dport,out,inb,duration=None):
-        self.conns.append((t,self.key(dst,dport),out,inb,duration))
-        self.tick(t,out=out)
+    def contacted_name(self,t,dst,key):
+        """Record at contact time, so a later DNS-cache overwrite cannot erase the evidence."""
+        seen = self.dns_seen_at.get(dst)
+        if seen is None or not 0 <= t-seen <= IDN_DNS_MAX_AGE:
+            return
+        detail = international_domain(self.ip_domain.get(dst,''))
+        if detail is None:
+            return
+        identity = (key,detail['subject'])
+        self.idn_contacts.pop(identity,None)
+        self.idn_contacts[identity] = (t,detail)
+        while len(self.idn_contacts) > MAX_IDN_CONTACTS:
+            self.idn_contacts.popitem(last=False)
 
-    def snapshot(self,t,flows):
+    @staticmethod
+    def counter(value):
+        """A missing kernel counter is unknown, never an observed zero."""
+        return value if type(value) in (int,float) and math.isfinite(value) and 0 <= value < 2**64 else None
+
+    def account(self,t,key,out,inb,state=None,baseline=False):
+        """Ingest cumulative socket counters once, independently for each direction."""
+        out,inb = self.counter(out),self.counter(inb)
+        deltas = []
+        for name,value in (('out',out),('in',inb)):
+            previous = state.get(name) if state is not None else None
+            unknown_start = baseline or (state is not None and state.get('sampled') and previous is None)
+            if unknown_start:
+                delta = 0 if value == 0 else None
+            elif value is None or (previous is not None and value < previous):
+                delta = None
+            else:
+                delta = value if previous is None else value-previous
+            deltas.append(delta)
+            if state is not None and value is not None:
+                state[name] = value
+        if state is not None:
+            state['sampled'] = True
+        if (not baseline and any(value is None or value > 0 for value in deltas)) or (baseline and deltas == [0,0]):
+            self.transfers.append((t,key,*deltas))
+        if deltas[0] is not None:
+            self.tick(t,out=deltas[0])
+        return deltas
+
+    def flow(self,t,tuple4,token):
+        identity = (tuple(tuple4),token)
+        state = self.flows.get(identity)
+        if state is None:
+            state = dict(out=None,**{'in':None},seen=t,closed=False)
+            self.flows[identity] = state
+        state['seen'] = max(t,state['seen'])
+        self.flows.move_to_end(identity)
+        while len(self.flows) > MAX_FLOWS:
+            _,lost = self.flows.popitem(last=False)
+            self.flow_loss_time = max(self.flow_loss_time,lost['seen'])
+        return state
+
+    def close(self,t,dst,dport,out,inb,duration=None,tuple4=None,token=None):
+        """Final totals; optional socket identity prevents recounting preceding snapshots.
+
+        Legacy callers without a tuple are standalone connections. Collector callers provide
+        a kernel cookie as well, so a delayed close cannot consume a reused tuple's counters.
+        """
+        key = self.key(dst,dport)
+        existing = tuple4 is not None and (tuple(tuple4),token) in self.flows
+        state = self.flow(t,tuple4,token) if tuple4 is not None else None
+        if state is not None and state['closed']:
+            return  # duplicate destroy event, or an older ss result delivered after destruction
+        out,inb = self.counter(out),self.counter(inb)
+        duration = duration if type(duration) in (int,float) and math.isfinite(duration) and duration >= 0 else None
+        uncertain = state is not None and not existing and self.flow_loss_time != float('-inf') and (
+            duration is None or t-duration <= self.flow_loss_time)
+        self.account(t,key,out,inb,state,baseline=uncertain)
+        self.conns.append((t,key,out,inb,duration))
+        if state is not None:
+            state['closed'] = True
+
+    def snapshot(self,t,flows,starts=None):
         """Long-lived connections: a send burst counts as an event, so heartbeats on one socket are timed too."""
-        current = {}
-        for src,sport,dst,dport,out,inb in flows:
+        for item in flows:
+            src,sport,dst,dport,out,inb = item[:6]
+            out,inb = self.counter(out),self.counter(inb)
+            token = item[6] if len(item) > 6 else None
+            self.contacted_name(t,dst,self.key(dst,dport))
             tuple4 = (src,sport,dst,dport)
-            current[tuple4] = (out,inb)
-            old = self.flows.get(tuple4)
-            if old and out > old[0]:
-                key = self.key(dst,dport)
+            identity = (tuple4,token)
+            old = self.flows.get(identity)
+            # With no cookie, a lower counter is the only available sign of tuple reuse.
+            if old and old['closed'] and token is None:
+                if any(value is not None and old[name] is not None and value < old[name]
+                       for name,value in (('out',out),('in',inb))):
+                    del self.flows[identity]
+                    old = None
+            state = self.flow(t,tuple4,token)
+            if state['closed']:
+                continue
+            if old is None and starts is not None:
+                start = starts.get(tuple4)
+                state['started'] = start if start is not None and 0 <= t-start < FLOW_RETENTION else None
+            had_out = old is not None and old['out'] is not None
+            previous = old['out'] if had_out else None
+            key = self.key(dst,dport)
+            start = state.get('started')
+            reliable_start = start is not None and start > self.flow_loss_time
+            delta,_ = self.account(t,key,out,inb,state,baseline=old is None and not reliable_start)
+            if had_out and out is not None and out >= previous and delta is not None and delta > 0:
                 self.events.setdefault(key,deque(maxlen=300)).append(t)
-                self.tick(t,out=out-old[0])
-        self.flows = current
+        self.prune_flows(t)
+
+    def prune_flows(self,now):
+        for identity,state in list(self.flows.items()):
+            if now-state['seen'] >= (FLOW_GRACE if state['closed'] else FLOW_RETENTION):
+                self.flow_loss_time = max(self.flow_loss_time,state['seen'])
+                del self.flows[identity]
+
+    def volumes(self,key,now):
+        """Known deltas in the observation window; any missing direction stays unavailable."""
+        transfers = [item for item in self.transfers if item[1] == key and 0 <= now-item[0] < WINDOW]
+        return tuple(sum(item[column] for item in transfers) if transfers and all(
+            item[column] is not None for item in transfers) else None for column in (2,3))
 
     def user_idle(self,t,idle):
         self.idle = [(s,i) for s,i in self.idle if t-s < WINDOW]+[(t,idle)]
@@ -221,10 +396,15 @@ class NetworkAnalyzer:
         return bool(before and before[-1])
 
     # ---------- analysis ----------
+    def international_contacts(self,now):
+        return [dict(subject=detail['subject'],key=key,kind='idn',score=70,indicators=['idn'],
+                     evidence=list(detail['evidence']),process=self.processes.get(key),when=stamp)
+                for (key,_),(stamp,detail) in self.idn_contacts.items() if 0 <= now-stamp < WINDOW]
+
     def destination(self,key,now):
         parts, evidence = [], []
-        times = [t for t in self.events.get(key,()) if now-t < WINDOW]
-        conns = [c for c in self.conns if c[1] == key and now-c[0] < WINDOW]
+        times = [t for t in self.events.get(key,()) if 0 <= now-t < WINDOW]
+        conns = [c for c in self.conns if c[1] == key and 0 <= now-c[0] < WINDOW]
         strength,period,cv,beats = beacon(times)
         first = self.base['dest'].get(key,[now])[0]
         days = 0
@@ -237,7 +417,7 @@ class NetworkAnalyzer:
             if span > 1:
                 parts.append(('persist',min(1,span/6)))
                 evidence.append(f'persistente da {span:.1f} ore')
-            sizes = [c[2] for c in conns]
+            sizes = [c[2] for c in conns if c[2] is not None]
             if len(sizes) >= 5 and statistics.mean(sizes) > 0:
                 size_cv = statistics.pstdev(sizes)/statistics.mean(sizes)
                 if size_cv < .25:
@@ -251,9 +431,8 @@ class NetworkAnalyzer:
         if now-first < 24*3600 and learnt:
             parts.append(('new',1.))
             evidence.append('destinazione mai vista prima di oggi')
-        out = sum(c[2] for c in conns)
-        inb = sum(c[3] for c in conns)
-        if out > 5e6 and out/(inb+1) > 3:
+        out,inb = self.volumes(key,now)
+        if out is not None and inb is not None and out > 5e6 and out/(inb+1) > 3:
             parts.append(('volume',min(1,math.log10(out/5e6)+.5)))
             evidence.append(f'{out/1e6:.1f} MB inviati e {inb/1e6:.1f} MB ricevuti (rapporto {out/(inb+1):.0f}:1): possibile esfiltrazione')
         durations = [c[4] for c in conns if c[4] is not None]
@@ -264,7 +443,7 @@ class NetworkAnalyzer:
             # A rhythm kept for days (mail, sync, chat heartbeats) is a habit: every facet of it is damped together.
             parts = [(name,s*.3 if name in ('beacon','sizes','persist','dnsfirst','short') else s) for name,s in parts]
         vector = self.vector(key,times,conns,strength,now)
-        if self.forest:
+        if self.forest and all(value is not None for value in vector):
             isolation = self.forest.score(vector)
             if isolation > .6:
                 parts.append(('iforest',(isolation-.6)/.25))
@@ -272,17 +451,17 @@ class NetworkAnalyzer:
         return parts,evidence,vector,times
 
     def vector(self,key,times,conns,regularity,now):
-        out = sum(c[2] for c in conns)
-        inb = sum(c[3] for c in conns)
+        out,inb = self.volumes(key,now)
         durations = [c[4] for c in conns if c[4] is not None]
         first = self.base['dest'].get(key,[now])[0]
-        return [math.log1p(out),math.log1p(inb),math.log1p(out/(inb+1)),math.log1p(len(times)),
-                math.log1p(statistics.median(durations)) if durations else 0.,regularity,
-                math.log1p((now-first)/3600),0. if key.endswith((':443',':80')) else 1.]
+        return [math.log1p(out) if out is not None else None,math.log1p(inb) if inb is not None else None,
+                math.log1p(out/(inb+1)) if out is not None and inb is not None else None,math.log1p(len(times)),
+                math.log1p(statistics.median(durations)) if durations else None,regularity,
+                math.log1p(max(0,now-first)/3600),0. if key.endswith((':443',':80')) else 1.]
 
     def domains(self,now):
         found = []
-        recent = [d for d in self.dns if now-d[0] < DNS_WINDOW]
+        recent = [d for d in self.dns if 0 <= now-d[0] < DNS_WINDOW]
         failing = {name for t,name,qtype,rcode,response in recent if response and rcode == 3}
         if len(failing) >= 8:
             likeness = statistics.mean(dga_likeness(n) for n in failing)
@@ -335,11 +514,14 @@ class NetworkAnalyzer:
 
     def analyze(self,now=None):
         now = time.time() if now is None else now
-        keys = {k for k,v in self.events.items() if v and now-v[-1] < WINDOW} | {c[1] for c in self.conns if now-c[0] < WINDOW}
+        keys = ({k for k,v in self.events.items() if v and 0 <= now-v[-1] < WINDOW}
+                | {c[1] for c in self.conns if 0 <= now-c[0] < WINDOW}
+                | {c[1] for c in self.transfers if 0 <= now-c[0] < WINDOW})
         results, vectors = [], []
         for key in keys:
             parts,evidence,vector,times = self.destination(key,now)
-            vectors.append(vector)
+            if all(value is not None for value in vector):
+                vectors.append(vector)
             if not parts:
                 continue
             score = noisy_or(parts)
@@ -350,7 +532,7 @@ class NetworkAnalyzer:
                 evidence.append(f'{idle_share*100:.0f}% dell’attività mentre l’utente era inattivo')
             results.append(dict(subject=self.label(key),key=key,kind='destinazione',score=round(score,1),evidence=evidence,
                                 indicators=[p for p,_ in parts],process=self.processes.get(key),when=when))
-        results += self.domains(now)+self.device(now)
+        results += self.domains(now)+self.device(now)+self.international_contacts(now)
         for result in results:
             result['score'] = round(result['score'],1)
         # Retrain the forest on this machine's own history; today's vectors join it for tomorrow.
@@ -363,8 +545,13 @@ class NetworkAnalyzer:
         return sorted(results,key=lambda r: -r['score'])
 
     def prune(self,now):
+        self.prune_flows(now)
+        self.transfers = deque((item for item in self.transfers if now-item[0] < WINDOW),maxlen=20000)
+        for identity in [identity for identity,(stamp,_) in self.idn_contacts.items() if now-stamp >= WINDOW]:
+            del self.idn_contacts[identity]
         for key in [k for k,v in self.events.items() if not v or now-v[-1] > WINDOW]:
             del self.events[key]
+            self.contact_names.pop(key,None)
         if len(self.ip_domain) > 50000:
             self.ip_domain = dict(list(self.ip_domain.items())[-25000:])
         for name in ('dest','domains'):

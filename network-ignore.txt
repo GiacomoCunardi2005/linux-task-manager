@@ -1,8 +1,11 @@
 # Eccezioni per gli avvisi delle destinazioni di rete, una per riga.
 # Un dominio include i suoi sottodomini; si possono indicare anche IP esatti.
-# La corrispondenza di un dominio dipende dalle risposte DNS osservate di recente.
+# I nomi osservati vengono riconfermati via DNS in background quando scadono.
 # Un servizio noto non garantisce che ogni connessione sia innocua.
 spotify.com
+gew4-dealer-ssl.spotify.com # nome verificato, risolto automaticamente
+dl.flathub.org # download Flathub
+mirror.krfoss.org # mirror Arch Linux
 youtube.com
 microsoft.com
 apple.com
@@ -10,3 +13,113 @@ github.com
 wikipedia.org
 claude.ai
 chatgpt.com
+ws.chatgpt.com # nome risolto anche quando non osservato nel traffico DNS
+openai.com
+www.whatsapp.com
+api.bitwarden.eu
+discord.com # app e API
+discord.gg # gateway (gateway-*.discord.gg)
+discordapp.com # CDN
+discordapp.net # media
+discord.media # chiamate vocali
+# Anthropic
+anthropic.com
+claude.com
+claudeusercontent.com
+# GitHub
+githubusercontent.com
+githubassets.com
+github.io
+githubcopilot.com
+ghcr.io
+# Google (servizi propri; non googleusercontent.com, che ospita anche contenuti di terzi)
+google.com
+google.it
+googleapis.com
+gstatic.com
+googlevideo.com
+ytimg.com
+gvt1.com
+gvt2.com
+# Spotify: i client si collegano per IP agli access point, senza DNS osservabile
+ap.spotify.com # nome risolto in background e confrontato con l'IP
+ap-gew4.spotify.com # access point Europa occidentale
+spotifycdn.com
+scdn.co
+# Sistema e pacchetti
+archlinux.org
+cachyos.org
+flathub.org
+flatpak.org
+mozilla.org
+mozilla.net
+firefox.com
+# Sviluppo
+pypi.org
+pythonhosted.org
+python.org
+npmjs.org
+npmjs.com
+crates.io
+rust-lang.org
+jetbrains.com
+# Altri servizi in uso
+live.com
+office.com
+visualstudio.com
+whatsapp.net
+bitwarden.com
+unipi.it # università
+# Notifiche push di Google (porta 5228): nome esatto, così l'IP viene riconosciuto anche senza DNS osservato
+mtalk.google.com
+mcp.trivago.com # connettore MCP
+# OpenAI (app ChatGPT e Codex)
+oaistatic.com
+oaiusercontent.com
+# Meta (WhatsApp)
+whatsapp.com
+fbcdn.net
+# Sistema Linux e hardware
+gnome.org
+freedesktop.org
+kde.org
+fwupd.org # aggiornamenti firmware (LVFS)
+lenovo.com
+beacondb.net # geolocalizzazione di GNOME
+# Sviluppo
+gitlab.com
+stackoverflow.com
+stackexchange.com
+sstatic.net
+docs.rs
+go.dev
+golang.org
+nodejs.org
+yarnpkg.com
+vscode-cdn.net
+vsassets.io
+# Messaggistica e lavoro
+telegram.org
+signal.org
+zoom.us
+slack.com
+proton.me
+# Ricerca, informazione e media
+duckduckgo.com
+bing.com
+wikimedia.org
+reddit.com
+redditstatic.com
+redd.it
+netflix.com
+nflxvideo.net
+twitch.tv
+amazon.com
+amazon.it
+icloud.com
+linkedin.com
+# Giochi
+steampowered.com
+steamcommunity.com
+steamstatic.com
+valvesoftware.com

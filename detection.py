@@ -1,6 +1,7 @@
 """Suspicious-activity heuristics on data the monitor already reads. Not an antivirus: no file signatures."""
 from collections import deque
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import pwd
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))  # python -I (exec watcher, root service) skips the script folder
 from agents import AgentScanner  # noqa: E402
+from wine import WinePrefixScanner, process_reasons as wine_process_reasons, wine_prefix, is_wine  # noqa: E402
 import select
 
 SYSTEM_DIRS = ('/usr/','/bin/','/sbin/','/lib','/opt/','/snap/','/app/','/nix/store/','/var/lib/flatpak/')
@@ -302,13 +304,50 @@ PROC_STATES = {'R':'running','S':'sleeping','D':'disk-sleep','T':'stopped','t':'
 class ProcessScanner:
     """Process rows for the app and the root service at a fraction of psutil's cost.
 
-    Every second only /proc/PID/stat (state, parent, CPU, threads, RSS) and /proc/PID/io are read; name,
-    executable, command line, user and start time never change for one process, so psutil reads them once
-    per new process. The start time must be psutil's: app and root service match rows on it.
+    Cheap /proc image fingerprints detect exec and credential changes without repeating
+    full psutil descriptions for unchanged processes. PID/start time remains the GUI identity;
+    exec_generation distinguishes successive images of that same process.
     """
     def __init__(self):
         self.last, self.static, self.time, self.cores = {}, {}, time.monotonic(), psutil.cpu_count() or 1
         self.processes = self.threads = 0
+        self.exec_lock, self.exec_revisions, self.exec_counter = threading.Lock(), {}, 0
+        self.boot_id = read('/proc/sys/kernel/random/boot_id') or None
+
+    def exec_seen(self,row):
+        with self.exec_lock:
+            self.exec_counter += 1
+            self.exec_revisions[row['pid']] = (row['created'],self.exec_counter)
+            while len(self.exec_revisions) > 4096:
+                self.exec_revisions.pop(next(iter(self.exec_revisions)))
+
+    @staticmethod
+    def image(pid):
+        """Metadata only; missing permissions remain explicit in the fingerprint."""
+        base = f'/proc/{pid}/'
+        try:
+            exe = os.readlink(base+'exe')
+            stat = os.stat(base+'exe')
+            inode = (stat.st_dev,stat.st_ino,stat.st_ctime_ns)
+        except OSError:
+            exe,inode = None,None
+        try:
+            with open(base+'cmdline','rb') as handle:
+                command = handle.read(65537)
+        except OSError:
+            command = None
+        try:
+            with open(base+'status','rb') as handle:
+                credentials = []
+                for line in handle:
+                    if line.startswith((b'Uid:',b'Gid:')):
+                        credentials.append(line.strip())
+                        if len(credentials) == 2:
+                            break
+                credentials = tuple(credentials)
+        except OSError:
+            credentials = None
+        return exe,inode,command,credentials
 
     @staticmethod
     def describe(pid):
@@ -324,7 +363,7 @@ class ProcessScanner:
     def rows(self):
         now = time.monotonic()
         dt, self.time = max(1e-3,now-self.time), now
-        rows, current, static = [], {}, {}
+        rows, current, static, alive = [], {}, {}, set()
         threads = 0
         for entry in os.scandir('/proc'):
             if not entry.name.isdigit():
@@ -340,28 +379,97 @@ class ProcessScanner:
             except (OSError,IndexError,ValueError):
                 continue  # exited meanwhile
             key = (pid,start)
-            info = self.static.get(key) or self.describe(pid)
+            alive.add(key)
+            name = line[line.find(b'(')+1:line.rfind(b')')].decode(errors='replace')
+            signature = (name,self.image(pid))
+            old_info = self.static.get(key)
+            with self.exec_lock:
+                revision = self.exec_revisions.get(pid)
+            forced = old_info is not None and revision is not None and revision[0] == old_info['created'] and revision != old_info.get('_revision')
+            changed = old_info is not None and (forced or old_info.get('_signature') != signature)
+            info = self.describe(pid) if old_info is None or changed else old_info
             if info is None:
                 continue
-            static[key] = info
             try:
                 with open(f'/proc/{pid}/io','rb') as handle:
                     counters = dict(item.split(b': ') for item in handle.read().splitlines())
-                io_bytes = int(counters[b'read_bytes'])+int(counters[b'write_bytes'])
+                read_bytes,write_bytes = int(counters[b'read_bytes']),int(counters[b'write_bytes'])
             except (OSError,KeyError,ValueError):
-                io_bytes = None  # other users' processes without root
-            old_cpu,old_io = self.last.get(key,(None,None))
-            current[key] = (cpu_time,io_bytes)
+                read_bytes,write_bytes = None,None
+            try:
+                with open(f'/proc/{pid}/stat','rb') as handle:
+                    after = handle.read()
+                after_fields = after[after.rfind(b')')+2:].split()
+                after_name = after[after.find(b'(')+1:after.rfind(b')')].decode(errors='replace')
+                if int(after_fields[19]) != start or (after_name,self.image(pid)) != signature:
+                    continue  # exec/reuse during sampling: wait for a coherent snapshot
+            except (OSError,IndexError,ValueError):
+                continue
+            with self.exec_lock:
+                if self.exec_revisions.get(pid) != revision:
+                    continue
+            if old_info is None or changed:
+                info = dict(info,_signature=signature,_revision=revision,
+                            exec_generation=(old_info.get('exec_generation',0)+1 if old_info else 0))
+            static[key] = info
+            old_cpu,old_read,old_write = self.last.get(key,(None,None,None)) if not changed else (None,None,None)
+            current[key] = (cpu_time,read_bytes,write_bytes)
+            cpu_cores = max(0,cpu_time-old_cpu)/dt if old_cpu is not None else None
+            def io_rate(value,old):
+                return (value-old)/dt if value is not None and old is not None and value >= old else None
+            io_read,io_write = io_rate(read_bytes,old_read),io_rate(write_bytes,old_write)
             threads += count
-            rows.append(dict(info,pid=pid,ppid=ppid,status=PROC_STATES.get(state,state),memory=rss,
-                cpu=min(100,max(0,cpu_time-old_cpu)/dt*100/self.cores) if old_cpu is not None else None,
-                disk=max(0,(io_bytes-old_io)/dt) if io_bytes is not None and old_io is not None else None))
-        self.last, self.static = current, static
+            complete = all(value is not None for value in signature[1]) and len(signature[1][3]) == 2 and len(signature[1][2]) <= 65536
+            image = hashlib.sha256(repr(signature).encode()).hexdigest() if complete else None
+            rows.append(dict({k:v for k,v in info.items() if not k.startswith('_')},pid=pid,ppid=ppid,
+                start_ticks=start,boot_id=self.boot_id,image_fingerprint=image,threads=count,
+                status=PROC_STATES.get(state,state),memory=rss,cpu_cores=cpu_cores,
+                cpu=min(100,cpu_cores*100/self.cores) if cpu_cores is not None else None,
+                io_read=io_read,io_write=io_write,io_read_bytes=read_bytes,io_write_bytes=write_bytes,
+                disk=io_read+io_write if io_read is not None and io_write is not None else None))
+        # A racing exec omits this observation, not the image generation's history.
+        self.last = current
+        self.static = {key:value for key,value in self.static.items() if key in alive}
+        self.static.update(static)
         self.processes, self.threads = len(rows), threads
         return rows
 
 
 PROC_EVENT_EXEC = 0x2
+INTERPRETER = re.compile(r'^((ba|da|z|k|c|tc|fi|a)?sh|python[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node(js)?|php[0-9.]*|lua[0-9.]*|pwsh|bun|deno|tclsh[0-9.]*)$')
+INLINE = {'sh':('c',),'python':('-c',),'perl':('-e','-E'),'ruby':('-e',),'node':('-e','--eval','-p','--print'),'php':('-r',),
+          'lua':('-e',),'pwsh':('-c','-Command','-command'),'bun':('-e','--eval'),'deno':('eval',)}
+
+
+def printable(text,limit):
+    text = ''.join(c if c.isprintable() else '?' for c in str(text))
+    return text if len(text) <= limit else text[:limit-1]+'…'
+
+
+def program_file(exe,cmdline,cwd=None):
+    """The file that actually runs: for bash, python, node… the script or inline command, not the interpreter."""
+    exe = exe or ''
+    cmdline = list(cmdline or [])
+    base = os.path.basename(exe or (cmdline[0] if cmdline else ''))
+    if re.match(r'^wine(64)?(-preloader)?$',base) and cmdline and re.match(r'^[A-Za-z]:\\',cmdline[0]):
+        # Wine/Proton keep the Windows program as argv[0]; the loader path alone would hide it.
+        return f'programma Windows {printable(cmdline[0],4096)} (Wine/Proton {exe or base})'
+    if not INTERPRETER.match(base) or len(cmdline) < 2:
+        return printable(exe,4096) if exe else 'percorso del file non disponibile'
+    family = 'sh' if base.endswith('sh') and base not in ('pwsh',) else re.match(r'[a-z]+',base)[0]
+    args = cmdline[1:]
+    for index,arg in enumerate(args):
+        inline = (family == 'sh' and arg.startswith('-') and not arg.startswith('--') and 'c' in arg[1:]) or arg in INLINE.get(family,())
+        if inline:
+            code = args[index+1] if index+1 < len(args) else ''
+            return f'comando in linea «{printable(code,200)}» (interprete {exe or base})'
+        if family == 'python' and arg == '-m' and index+1 < len(args):
+            return f'modulo Python {printable(args[index+1],200)} (interprete {exe or base})'
+        if arg.startswith('-'):
+            continue
+        script = arg if os.path.isabs(arg) or not cwd else os.path.normpath(os.path.join(cwd,arg))
+        return f'script {printable(script,4096)} (interprete {exe or base})'
+    return printable(exe,4096) if exe else base
 
 
 def parse_proc_events(data):
@@ -411,9 +519,10 @@ def exec_watch_main():
 
 class ExecWatcher(threading.Thread):
     """Linux proc connector: notified on every exec(), so processes shorter than the 1 s sample are seen."""
-    def __init__(self,detector):
+    def __init__(self,detector,on_exec=None):
         super().__init__(daemon=True)
         self.detector = detector
+        self.on_exec = on_exec
         # pid -> (time, (name, description)) of recent execs: a reader that exits before /proc can be read is
         # still named, because exec is reported before the program opens anything.
         self.recent = {}
@@ -433,6 +542,8 @@ class ExecWatcher(threading.Thread):
             except ValueError:
                 continue
             self.remember(row)
+            if self.on_exec:
+                self.on_exec(row)
             self.detector.exec_seen(row)
 
     def remember(self,row):
@@ -468,7 +579,22 @@ class ExecWatcher(threading.Thread):
             return None
         name = stat_line[stat_line.find('(')+1:stat_line.rfind(')')]
         ppid = int(stat_line[stat_line.rfind(')')+2:].split()[1])
-        return dict(pid=pid,created=created,name=name,exe=exe and exe.removesuffix(' (deleted)'),cmdline=cmdline,ppid=ppid,uid=uid)
+        try:
+            cwd = os.readlink(base+'cwd')
+        except OSError:
+            cwd = None
+        # Who launched it: the parent usually outlives a short command and names the real origin.
+        parent = dict(pid=ppid)
+        try:
+            with open(f'/proc/{ppid}/comm') as handle:
+                parent['name'] = handle.read().strip()
+            parent['exe'] = os.readlink(f'/proc/{ppid}/exe').removesuffix(' (deleted)')
+            with open(f'/proc/{ppid}/cmdline','rb') as handle:
+                parent['cmdline'] = [arg.decode(errors='replace') for arg in handle.read().split(b'\0')[:8] if arg]
+        except OSError:
+            pass
+        return dict(pid=pid,created=created,name=name,exe=exe and exe.removesuffix(' (deleted)'),cmdline=cmdline,ppid=ppid,uid=uid,
+                    cwd=cwd,parent=parent)
 
     def close(self):
         if self.child.poll() is None:
@@ -486,12 +612,28 @@ def validate_threats(threats):
         ok(finding,'pid',lambda v:type(v) is int and 0 < v < 2**31)
         ok(finding,'created',lambda v:isinstance(v,(int,float)) and not isinstance(v,bool))
         ok(finding,'reasons',lambda v:isinstance(v,list) and 0 < len(v) <= 32 and all(isinstance(s,str) for s in v))
+        if 'notification_reasons' in finding:
+            ok(finding,'notification_reasons',lambda v:isinstance(v,list) and 0 < len(v) <= 33 and all(isinstance(s,str) for s in v))
+        if 'image' in finding:
+            ok(finding,'image',lambda v:isinstance(v,dict))
+            image = finding['image']
+            if any(k in image and not isinstance(image[k],(str,type(None))) for k in ('name','boot_id','image_fingerprint')):
+                raise ValueError('Identità immagine non valida.')
+            if 'start_ticks' in image:
+                ok(image,'start_ticks',lambda v:type(v) is int and v >= 0)
+            if 'cmdline' in image:
+                ok(image,'cmdline',lambda v:isinstance(v,list) and all(isinstance(s,str) for s in v))
     for finding in threats['processes']+threats['system']:
         ok(finding,'severity',lambda v:v in ('media','alta'))
     for finding in threats['system']:
         ok(finding,'reason',lambda v:isinstance(v,str))
     if not all(isinstance(s,str) for s in threats['traps']):
         raise ValueError('Dati del servizio root non validi.')
+    activity = threats.get('file_activity')
+    if activity is not None:
+        ok(activity,'available limited',lambda v:type(v) is bool)
+        ok(activity,'roots errors',lambda v:isinstance(v,list) and len(v) <= 32 and all(isinstance(s,str) for s in v))
+        ok(activity,'lost unattributed',lambda v:type(v) is int and v >= 0)
     return threats
 
 
@@ -505,13 +647,17 @@ def crontab(user=None):
 
 class Detector:
     def __init__(self,home=None,proc=Path('/proc'),usb_root=Path('/sys/bus/usb/devices'),config=None,read_crontab=crontab,traps=None,
-                 preload=Path('/etc/ld.so.preload'),system_startup=SYSTEM_STARTUP,agents=None,agent_baseline=None):
+                 preload=Path('/etc/ld.so.preload'),system_startup=SYSTEM_STARTUP,agents=None,agent_baseline=None,wine=None):
         self.home = Path(home or Path.home())
         self.agents = AgentScanner(self.home,agent_baseline or self.home/'.cache'/'linux-task-manager'/'agents.json',
                                    downloads=user_dir(self.home,'DOWNLOAD'),commands=COMMANDS) if agents is None else agents
+        # Wine/Proton is a malware vector, never a trusted category: prefixes are scanned for Windows autostarts.
+        self.wine = WinePrefixScanner(self.home) if wine is None else wine
+        self.wine_seen = set()
         self.system_startup = system_startup
         self.preload = Path(preload)
         self.exec_lock, self.exec_pending, self.short_lived = threading.Lock(), {}, []
+        self.exec_revisions, self.exec_counter, self.static_signatures = {}, 0, {}
         self.proc, self.usb_root, self.read_crontab = Path(proc), Path(usb_root), read_crontab
         self.config = Path(config or Path(os.environ.get('XDG_CONFIG_HOME',self.home/'.config'))/'linux-task-manager'/'detection-ignore.txt')
         self.traps = Traps() if traps is None else traps
@@ -528,7 +674,7 @@ class Detector:
             return set()
 
     def static_reasons(self,row):
-        """Exe/cmdline/name do not change for one PID + start time, so these checks run once per process."""
+        """Checks cached only while the observed process image remains unchanged."""
         reasons = []
         exe, name, pid = row.get('exe') or '', row['name'], row['pid']
         # Real kernel threads are kthreadd (PID 2) or its children; this works even without access to other users' exe.
@@ -545,6 +691,7 @@ class Detector:
             reasons.append(('media',f'Eseguibile in una cartella temporanea ({exe})'))
         command = ' '.join(row.get('cmdline') or [])
         reasons += [(level,text) for pattern,level,text in COMMANDS if pattern.search(command)]
+        reasons += wine_process_reasons(row)
         return reasons
 
     def socket_ports(self,now):
@@ -611,13 +758,22 @@ class Detector:
             for pid in hit['pids']:
                 trapped.setdefault(pid,[]).append((hit['severity'],'Ha aperto un file trappola: '+hit['reason']))
         alive, processes = set(), []
+        with self.exec_lock:
+            revisions = dict(self.exec_revisions)
         for row in rows:
             identity = (row['pid'],row['created'])
             alive.add(identity)
+            if self.wine and identity not in self.wine_seen and is_wine(row.get('exe'),row.get('cmdline')):
+                self.wine_seen.add(identity)  # once per process: its prefix joins the autostart scan
+                self.wine.add(wine_prefix(row['pid'],self.proc))
             if row.get('exe') in ignored or row['name'] in ignored:
                 continue
-            if identity not in self.static:
+            signature = (row.get('exec_generation'),row.get('image_fingerprint'),row['name'],row.get('exe'),
+                         tuple(row.get('cmdline') or ()),row.get('uid'),revisions.get(identity))
+            if self.static_signatures.get(identity) != signature:
                 self.static[identity] = self.static_reasons(row)
+                self.static_signatures[identity] = signature
+                self.cpu.pop(identity,None)
             reasons = list(self.static[identity])+trapped.get(row['pid'],[])
             reasons += [('media',f'Connessione sulla porta {port} ({PORTS[port]}), {where}') for port,where in sorted(sockets.get(row['pid'],()))]
             exe = row.get('exe') or ''
@@ -632,9 +788,13 @@ class Detector:
                 processes.append(dict(pid=row['pid'],created=row['created'],severity=max((r[0] for r in reasons),key=RANK.get),reasons=[r[1] for r in reasons]))
         self.collect_short_lived(alive,ignored)
         self.static = {k:v for k,v in self.static.items() if k in alive}
+        self.static_signatures = {k:v for k,v in self.static_signatures.items() if k in alive}
         self.cpu = {k:v for k,v in self.cpu.items() if k in alive}
         system = []
         parts = [lambda: self.startup_findings(now,ignored),self.keyboard_findings]
+        if self.wine:
+            parts.append(lambda: self.wine.scan(now,ignored))
+        self.wine_seen &= alive
         if self.agents:
             parts.append(lambda: self.agents.scan(now,ignored))
         for part in parts:
@@ -648,9 +808,16 @@ class Detector:
     def exec_seen(self,row):
         """Called by ExecWatcher right after exec(): judge the process before it can exit."""
         reasons = self.static_reasons(row)
-        if reasons and len(self.exec_pending) < 1000:
-            with self.exec_lock:
-                self.exec_pending[(row['pid'],row['created'])] = (row,reasons,time.strftime('%H:%M:%S'))
+        identity = (row['pid'],row['created'])
+        with self.exec_lock:
+            self.exec_counter += 1
+            self.exec_revisions[identity] = self.exec_counter
+            while len(self.exec_revisions) > 4096:
+                self.exec_revisions.pop(next(iter(self.exec_revisions)))
+            if reasons and len(self.exec_pending) < 1000:
+                self.exec_pending[identity] = (row,reasons,time.strftime('%H:%M:%S'))
+            elif not reasons:
+                self.exec_pending.pop(identity,None)
 
     def collect_short_lived(self,alive,ignored):
         # Processes still alive are reported by the normal row checks; the rest ended before the 1 s sample.
@@ -659,8 +826,13 @@ class Detector:
         for identity,(row,reasons,clock) in pending.items():
             if identity in alive or row['name'] in ignored or row.get('exe') in ignored:
                 continue
+            parent = row.get('parent') or {}
+            origin = (f"; avviato da {printable(parent.get('name','?'),64)} (PID {parent['pid']}, "
+                      f"{program_file(parent.get('exe'),parent.get('cmdline'))})" if parent.get('pid') else '')
+            folder = f"; cartella {printable(row['cwd'],4096)}" if row.get('cwd') else ''
             self.short_lived.append(dict(severity=max((r[0] for r in reasons),key=RANK.get),
-                reason=f"{clock} processo di breve durata PID {row['pid']} ({row['name']}): "+'; '.join(r[1] for r in reasons)))
+                reason=f"{clock} processo di breve durata PID {row['pid']} ({row['name']}) — {program_file(row.get('exe'),row.get('cmdline'),row.get('cwd'))}"
+                       f"{folder}{origin}: "+'; '.join(r[1] for r in reasons)))
         del self.short_lived[:-50]
 
     def trap_findings(self,ignored):

@@ -131,6 +131,7 @@ class DetectionTests(unittest.TestCase):
         system = self.detector.assess([alive],4,0.)['system']
         self.assertEqual(len(system),1)
         self.assertIn('breve durata PID 4321',system[0]['reason'])
+        self.assertIn('/dev/shm/dropper',system[0]['reason'])  # the alert names the file
         self.assertEqual(len(self.detector.assess([alive],4,1.)['system']),1)  # kept, not duplicated
 
     def test_exec_watcher_catches_a_one_millisecond_process(self):
@@ -141,10 +142,16 @@ class DetectionTests(unittest.TestCase):
             self.skipTest(f'proc connector non disponibile: {exc}')
         watcher.start()
         self.addCleanup(watcher.close)
-        subprocess.run(['sh','-c','true # stratum+tcp://quick.invalid:3333'])
+        subprocess.run(['sh','-c','true # stratum+tcp://quick.invalid:3333'],cwd=self.root)
         time.sleep(.5)
         system = self.detector.assess([],4,0.)['system']
-        self.assertTrue(any('breve durata' in s['reason'] and 'miner' in s['reason'] for s in system),system)
+        found = [s['reason'] for s in system if 'breve durata' in s['reason'] and 'miner' in s['reason']]
+        self.assertTrue(found,system)
+        # Not just /usr/bin/bash: the inline command, its folder and who launched it identify the origin.
+        self.assertIn('comando in linea «true # stratum+tcp://quick.invalid:3333»',found[0])
+        self.assertIn(f'cartella {self.root}',found[0])
+        self.assertIn(f'avviato da',found[0])
+        self.assertIn(f'PID {os.getpid()}',found[0])
 
     def test_exec_watcher_names_a_reader_that_already_exited(self):
         from detection import ExecWatcher
@@ -164,6 +171,22 @@ class DetectionTests(unittest.TestCase):
         self.assertIn('/cat',cat[-1][1])
         self.assertIsNone(Traps.describe(int(child.stdout)))  # the shell is gone: /proc no longer helps
         self.assertIsNone(watcher.recent_description(2**22+7))
+
+    def test_program_file_names_the_script_not_the_interpreter(self):
+        from detection import program_file
+        cases = [(('/usr/bin/bash',['sh','-c','curl x | sh']),'comando in linea «curl x | sh» (interprete /usr/bin/bash)'),
+                 (('/usr/bin/bash',['bash','-lc','id']),'comando in linea «id» (interprete /usr/bin/bash)'),
+                 (('/usr/bin/python3.14',['python3','-m','http.server']),'modulo Python http.server (interprete /usr/bin/python3.14)'),
+                 (('/usr/bin/python3.14',['python3','-u','./miner.py'],'/home/u/Scaricati'),'script /home/u/Scaricati/miner.py (interprete /usr/bin/python3.14)'),
+                 (('/usr/bin/node',['node','-e','x()']),'comando in linea «x()» (interprete /usr/bin/node)'),
+                 (('/usr/bin/curl',['curl','http://x']),'/usr/bin/curl'),
+                 ((None,[]),'percorso del file non disponibile'),
+                 (('/usr/bin/bash',['bash']),'/usr/bin/bash'),
+                 (('/opt/proton/files/lib/wine/i386-unix/wine-preloader',['C:\\Game\\game.exe','-windowed']),
+                  'programma Windows C:\\Game\\game.exe (Wine/Proton /opt/proton/files/lib/wine/i386-unix/wine-preloader)')]
+        for args,expected in cases:
+            self.assertEqual(program_file(*args),expected,args)
+        self.assertNotIn('\n',program_file('/usr/bin/bash',['sh','-c','a\nb']))  # control characters cannot break the alert
 
     def test_proc_connector_parser(self):
         import struct

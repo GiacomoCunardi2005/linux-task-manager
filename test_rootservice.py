@@ -55,9 +55,12 @@ class RootStateTests(unittest.TestCase):
                       and not p.info['exe'] and p.pid != 2 and p.ppid() != 2),None)
         if other is None:
             self.skipTest('nessun processo di un altro utente con eseguibile illeggibile')
-        finding = dict(pid=other.pid,created=other.info['create_time'],severity='alta',reasons=['dal servizio root'])
+        observed = next(r for r in monitor.scanner.rows() if r['pid'] == other.pid)
+        observed = dict(observed,exe='/usr/bin/servizio',disk=123.,observed_at=time.time())
+        image = {k:observed[k] for k in ('boot_id','start_ticks','name','cmdline','image_fingerprint')}
+        finding = dict(pid=other.pid,created=other.info['create_time'],severity='alta',reasons=['dal servizio root'],image=image)
         state = dict(threats=dict(processes=[finding],system=[],traps=['/tmp/x']),
-                     processes={f"{other.pid}:{other.info['create_time']!r}":dict(exe='/usr/bin/servizio',disk=123.)})
+                     processes={f"{other.pid}:{other.info['create_time']!r}":observed})
         with patch('metrics.root_state',return_value=state):
             data = monitor.sample()
         self.assertEqual(data['protection'],'root')
@@ -121,6 +124,17 @@ class NetworkIntegrationTests(unittest.TestCase):
         self.assertIn('processo curl (PID 42)',found[0]['reason'])
         self.assertNotIn('93',found[0]['reason'])  # the score changes every 30 s; the alert text must not
 
+    def test_idn_finding_becomes_a_domain_warning(self):
+        from metrics import valid_network
+        item = dict(subject='xn--bcher-kva.example',kind='idn',score=70.,indicators=['idn'],
+                    evidence=['Nome Unicode: bücher.example'],process='chrome (PID 42)')
+        self.assertTrue(valid_network(dict(anomalies=[item],features={},learning=False)))
+        found = rootservice.network_findings([item])
+        self.assertEqual(found[0]['severity'],'media')
+        self.assertIn('nome del dominio da verificare',found[0]['reason'])
+        self.assertIn('lettere non ASCII o Punycode',found[0]['reason'])
+        self.assertIn('chrome (PID 42)',found[0]['reason'])
+
     def test_network_ranking_validation(self):
         from metrics import valid_network
         self.assertTrue(valid_network(None))
@@ -147,6 +161,29 @@ class NetworkIntegrationTests(unittest.TestCase):
 
 
 class RootServiceTests(unittest.TestCase):
+    def test_file_findings_merge_by_identity_and_do_not_repeat_on_counter_changes(self):
+        from app import Window
+        activity = dict(available=True,roots=['/home/test/Documenti'],errors=[],lost=0,unattributed=0,limited=False)
+        def finding(count,severity='media'):
+            return dict(pid=42,created=1.,severity=severity,reasons=[f'Attività intensa sui file: {count} file distinti in 15 s'])
+        threats = dict(processes=[dict(pid=42,created=1.,severity='media',reasons=['Eseguibile temporaneo'])],system=[],traps=[])
+        rootservice.add_file_findings(threats,[finding(30)],activity)
+        self.assertEqual(len(threats['processes']),1)
+        self.assertEqual(len(threats['processes'][0]['reasons']),2)
+        self.assertEqual(threats['file_activity'],activity)
+        first = set(Window.alerts(dict(threats=threats)))
+        updated = dict(processes=[dict(pid=42,created=1.,severity='media',reasons=['Eseguibile temporaneo'])],system=[],traps=[])
+        rootservice.add_file_findings(updated,[finding(60)],activity)
+        self.assertEqual(set(Window.alerts(dict(threats=updated))),first)
+        escalated = dict(processes=[],system=[],traps=[])
+        rootservice.add_file_findings(escalated,[finding(100,'alta')],activity)
+        self.assertEqual(escalated['processes'][0]['severity'],'alta')
+        self.assertNotEqual(set(Window.alerts(dict(threats=escalated))),first)
+        from detection import validate_threats
+        self.assertIs(validate_threats(threats),threats)
+        with self.assertRaises(ValueError):
+            validate_threats(dict(threats,file_activity=dict(activity,available='yes')))
+
     def test_sampler_state_and_atomic_private_write(self):
         sampler = rootservice.Sampler()
         sampler.rows()

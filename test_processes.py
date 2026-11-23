@@ -11,14 +11,30 @@ from PySide6.QtGui import QIcon
 from PySide6.QtTest import QAbstractItemModelTester
 from PySide6.QtCore import Qt, QItemSelectionModel
 from PySide6.QtWidgets import QApplication, QMessageBox
-from processes import ProcessModel, ProcessAnomaliesDialog, process_groups
+from processes import ProcessModel, ProcessAnomaliesDialog, process_groups, file_activity_text, network_subject
 from metrics import Monitor, terminate_process
 import test_ui
 from test_ui import wait
-from app import Window
+from app import Window, listen_for_launches, forward_to_running
 
 
 class ProcessTests(unittest.TestCase):
+    def test_network_subject_shows_observed_name_or_unknown_without_exposing_ip(self):
+        self.assertEqual(network_subject(dict(kind='destinazione',key='172.64.148.235:443',subject='ws.chatgpt.com (172.64.148.235:443)')), 'ws.chatgpt.com')
+        self.assertEqual(network_subject(dict(kind='destinazione',key='172.64.148.235:443',subject='172.64.148.235:443')), 'Destinazione non identificata (porta 443)')
+        self.assertEqual(network_subject(dict(kind='destinazione',key='8.8.8.8:443',subject='8.8.8.8:443',reverse_name='dns.google')), 'DNS inverso: dns.google (da verificare)')
+        self.assertEqual(network_subject(dict(kind='destinazione',key='2001:db8::1:443',subject='2001:db8::1:443')), 'Destinazione non identificata (porta 443)')
+        self.assertEqual(network_subject(dict(kind='tunnel',subject='Dominio example.com')), 'Dominio example.com')
+
+    def test_file_activity_coverage_explains_missing_or_partial_collection(self):
+        self.assertIn('richiede il servizio root',file_activity_text(None))
+        activity = dict(available=True,roots=['/home/test/Documenti'],errors=[],lost=0,unattributed=0,limited=False)
+        self.assertIn('attivo',file_activity_text(activity))
+        partial = dict(activity,lost=1,unattributed=3)
+        self.assertIn('copertura parziale',file_activity_text(partial))
+        self.assertIn('3',file_activity_text(partial))
+        self.assertIn('non disponibile',file_activity_text(dict(activity,available=False,errors=['permesso negato'])))
+
     @classmethod
     def setUpClass(cls):
         test_ui.UITests.setUpClass()
@@ -114,11 +130,15 @@ class ProcessTests(unittest.TestCase):
                            system=[dict(severity='media',reason='Nuova tastiera USB collegata')])
             page.receive(dict(window.snapshot,process_rows=rows,threats=threats))
             self.assertTrue(page.process_anomalies.isEnabled())
-            self.assertEqual(page.process_anomalies.text(),'Anomalie dei processi (1)')
+            self.assertEqual(page.process_anomalies.text(),'Anomalie dei processi (2)')
             dialog = ProcessAnomaliesDialog(page,page.model)
             item = dialog.tree.topLevelItem(0)
             self.assertEqual([item.text(i) for i in range(4)],['Sospetto','miner','987662','test'])
+            self.assertEqual(item.text(4),'/tmp/miner')  # the file behind the process
             self.assertEqual(item.child(0).text(0),'Parametri tipici di un miner')
+            system_item = dialog.tree.topLevelItem(1)
+            self.assertEqual([system_item.text(i) for i in range(4)],['Da verificare','Avviso di sistema','—','—'])
+            self.assertEqual(system_item.child(0).text(0),'Nuova tastiera USB collegata')
             dialog.close()
             statuses = {page.proxy.index(i,0).data():page.proxy.index(i,1).data() for i in range(page.proxy.rowCount())}
             self.assertEqual(statuses['miner (2)'],'Sospetto')
@@ -134,6 +154,11 @@ class ProcessTests(unittest.TestCase):
             self.assertEqual(children['987662'],'Sospetto')
             self.assertNotEqual(children['987661'],'Sospetto')
             page.search.clear()
+            page.receive(dict(window.snapshot,process_rows=rows,threats=dict(processes=[],system=threats['system'])))
+            self.assertEqual(page.process_anomalies.text(),'Anomalie dei processi (1)')
+            dialog = ProcessAnomaliesDialog(page,page.model)
+            self.assertEqual(dialog.tree.topLevelItem(0).text(1),'Avviso di sistema')
+            dialog.close()
             legacy = dict(window.snapshot,process_rows=rows)
             legacy.pop('threats')
             page.receive(legacy)
@@ -141,7 +166,7 @@ class ProcessTests(unittest.TestCase):
             self.assertFalse(page.process_anomalies.isEnabled())
             page.receive(dict(window.snapshot,process_rows=rows,threats=dict(processes=[],system=[])))
             dialog = ProcessAnomaliesDialog(page,page.model)
-            self.assertIn('Nessun processo segnalato',dialog.tree.topLevelItem(0).text(1))
+            self.assertIn('Nessuna anomalia segnalata',dialog.tree.topLevelItem(0).text(1))
             dialog.close()
         finally:
             window.close()
@@ -171,6 +196,7 @@ class ProcessTests(unittest.TestCase):
             self.assertEqual(len(tray.messages),1)
             self.assertEqual(tray.messages[0][0],'Comportamento sospetto')
             self.assertIn('dropper (PID 987671)',tray.messages[0][1])
+            self.assertIn('percorso del file non disponibile',tray.messages[0][1])  # this fixture row has no exe
             self.assertIn('altri 1',tray.messages[0][1])
             self.assertIn('2 avvisi',tray.tooltip)
             window.receive(data)
@@ -187,7 +213,43 @@ class ProcessTests(unittest.TestCase):
             window.quitting = True
             window.close()
 
+    def test_second_launch_shows_the_running_window_instead_of_a_copy(self):
+        import socket
+        window = Window()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = str(Path(folder.name)/'instance.sock')
+        stale = socket.socket(socket.AF_UNIX)
+        stale.bind(path)
+        stale.close()  # a crash leaves the socket file behind with nobody listening
+        self.assertFalse(forward_to_running(dict(action='show'),path))
+        server = listen_for_launches(window,path)
+        try:
+            self.assertFalse(window.isVisible())  # hidden in the tray, as after login
+            with patch.dict(os.environ,{},clear=False):
+                os.environ.pop('XDG_ACTIVATION_TOKEN',None)
+                self.assertTrue(forward_to_running(dict(action='show',token='gnome-token-1'),path))
+                for _ in range(100):
+                    if window.isVisible():
+                        break
+                    wait(20)
+                self.assertTrue(window.isVisible())
+                self.assertEqual(os.environ.get('XDG_ACTIVATION_TOKEN'),'gnome-token-1')
+            window.hide()
+            self.assertTrue(forward_to_running(dict(action='tray'),path))  # a duplicate login autostart
+            wait(200)
+            self.assertFalse(window.isVisible())
+        finally:
+            server.close()
+            window.quitting = True
+            window.close()
+        self.assertFalse(forward_to_running(dict(action='show'),path))
+
     def test_live_rows_and_cpu_warmup(self):
+        # Local warmup only: an installed root service would already supply CPU values on the first sample.
+        root = patch('metrics.root_state',return_value=None)
+        root.start()
+        self.addCleanup(root.stop)
         monitor = Monitor()
         self.addCleanup(monitor.close)
         first = monitor.sample()

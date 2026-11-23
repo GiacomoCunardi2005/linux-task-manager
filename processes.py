@@ -11,11 +11,28 @@ from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QDialog, QTreeWidget, QTreeWidgetItem,
     QPushButton, QTreeView, QHeaderView, QAbstractItemView, QMessageBox, QStyledItemDelegate, QStyle)
 from metrics import size, terminate_process, terminate_as_root
+from detection import program_file
 
 HEADERS = ['Nome','Stato','CPU','Memoria','Disco','Rete','PID']
 STATES = {'running':'In esecuzione','sleeping':'In attesa','disk-sleep':'Attesa disco',
           'stopped':'Sospeso','tracing-stop':'In debug','zombie':'Zombie','idle':'Inattivo','dead':'Terminato'}
 SORT_ROLE = Qt.UserRole + 1
+
+
+def file_activity_text(activity):
+    if activity is None:
+        return 'Modifiche massive ai file: richiede il servizio root aggiornato.'
+    state = 'attivo' if activity['available'] else 'non disponibile'
+    if activity['available'] and (activity['errors'] or activity['lost'] or activity['limited']):
+        state = 'copertura parziale'
+    text = f'Modifiche massive ai file: {state}.'
+    if activity['roots']:
+        text += '\nCartelle: '+', '.join(activity['roots'])
+    if activity['lost'] or activity['limited']:
+        text += '\nAlcuni eventi non sono stati conservati: la copertura è incompleta.'
+    if activity['unattributed']:
+        text += f"\nEventi senza attribuzione certa al processo o alla cartella: {activity['unattributed']}."
+    return text+('\n'+'; '.join(activity['errors']) if activity['errors'] else '')
 
 
 def process_groups(rows):
@@ -60,6 +77,7 @@ class ProcessModel(QAbstractItemModel):
         self.totals = {}
         self.threats, self.system_threats, self.threats_available, self.traps = {}, [], True, []
         self.protection, self.root_available, self.network = 'utente', False, None
+        self.file_activity = None
         self.fallback_icon = fallback_icon
         self.icons = {}
         icon_paths = [str(Path(path)/'icons') for path in QStandardPaths.standardLocations(QStandardPaths.GenericDataLocation)]
@@ -128,7 +146,9 @@ class ProcessModel(QAbstractItemModel):
             if role == Qt.ForegroundRole:
                 return QColor('#ff99a4' if alarm == 'alta' else '#f5c26b')
             if role == Qt.ToolTipRole:
-                return '\n'.join(f"PID {f['pid']} · rischio {f['severity']}: "+'; '.join(f['reasons']) for f in findings)+'\nSegnali euristici, non una diagnosi antivirus.'
+                paths = {p['pid']:program_file(p.get('exe'),p.get('cmdline')) for p in row.get('children',[row])}
+                return '\n'.join(f"PID {f['pid']} · {paths.get(f['pid'],'percorso del file non disponibile')}\n  rischio {f['severity']}: "+'; '.join(f['reasons'])
+                                 for f in findings)+'\nSegnali euristici, non una diagnosi antivirus.'
             if role == SORT_ROLE:
                 return ('0' if alarm == 'alta' else '1')+values[1].casefold()
         value = values[column]
@@ -198,6 +218,7 @@ class ProcessModel(QAbstractItemModel):
         self.threats = {(f['pid'],f['created']):f for f in (threats or {}).get('processes',[])}
         self.system_threats = (threats or {}).get('system',[])
         self.traps = (threats or {}).get('traps',[])
+        self.file_activity = (threats or {}).get('file_activity')
         disk_loads = [d['value'] for d in data['disks'].values() if d['value'] is not None]
         self.totals = {2:f"{data['cpu']['value']:.0f}%",3:f"{data['memory']['value']:.0f}%",
             4:f"{max(disk_loads):.0f}%" if disk_loads else 'N/D',
@@ -382,9 +403,10 @@ class ProcessPage(QWidget):
     def update_status(self):
         model = self.model
         flagged = len(model.threats)
+        total = flagged + len(model.system_threats)
         self.process_anomalies.setEnabled(model.threats_available)
-        self.process_anomalies.setText(f'Anomalie dei processi ({flagged})' if flagged else 'Anomalie dei processi')
-        self.process_anomalies.setToolTip('Processi segnalati e motivi' if model.threats_available else 'Controlli di sicurezza non disponibili')
+        self.process_anomalies.setText(f'Anomalie dei processi ({total})' if total else 'Anomalie dei processi')
+        self.process_anomalies.setToolTip('Processi e avvisi di sistema con i rispettivi motivi' if model.threats_available else 'Controlli di sicurezza non disponibili')
         network = model.network
         self.network_button.setEnabled(network is not None)
         if network is not None:
@@ -396,7 +418,7 @@ class ProcessPage(QWidget):
             security = ' · Controlli di sicurezza non disponibili'
         elif flagged or system:
             security = ' · ⚠ '+', '.join(([f'{flagged} processi da verificare (cerca «sospetto»)'] if flagged else [])
-                +([f'{len(system)} avvisi di sistema (dettagli nel tooltip)'] if system else []))
+                +([f'{len(system)} avvisi di sistema (dettagli in Anomalie dei processi)'] if system else []))
         else:
             security = ' · Nessun comportamento sospetto rilevato'
         root = model.protection == 'root'
@@ -408,7 +430,8 @@ class ProcessPage(QWidget):
             +'Controlli euristici sui dati raccolti: non sostituiscono un antivirus. '
             +('Servizio root attivo: vede tutti i processi, chi apre le trappole e i processi brevi. Eccezioni: /etc/linux-task-manager/ignore.txt' if root else
               'Servizio root non attivo: installalo con sudo ./install-root-service.sh. Eccezioni: ~/.config/linux-task-manager/detection-ignore.txt')
-            +('\nTrappole attive (non aprirle): '+', '.join(model.traps) if model.traps else '\nNessuna trappola attiva'))
+            +('\nTrappole attive (non aprirle): '+', '.join(model.traps) if model.traps else '\nNessuna trappola attiva')
+            +'\n'+file_activity_text(model.file_activity))
 
     def toggle_pause(self):
         self.paused = not self.paused
@@ -468,30 +491,40 @@ class ProcessPage(QWidget):
 
 
 class ProcessAnomaliesDialog(QDialog):
-    """Show the evidence for each flagged process, including individual members of groups."""
+    """Show process findings and system alerts with their evidence."""
     def __init__(self,parent,model):
         super().__init__(parent)
         self.setWindowTitle('Anomalie dei processi')
         self.setStyleSheet('QDialog { background:#202020; }')
         self.resize(900,560)
         layout = QVBoxLayout(self)
-        note = QLabel('Processi segnalati dai controlli comportamentali. I motivi sono indizi da verificare, non una diagnosi antivirus. Il riepilogo mostra il campione al momento dell’apertura.')
+        note = QLabel('Processi segnalati e avvisi di sistema. I motivi sono indizi da verificare, non una diagnosi antivirus. Il riepilogo mostra il campione al momento dell’apertura.')
         note.setWordWrap(True)
         note.setStyleSheet('color:#bdbdbd; font-size:11px; padding:4px;')
         layout.addWidget(note)
+        coverage = QLabel(file_activity_text(model.file_activity).split('\n',1)[0])
+        coverage.setWordWrap(True)
+        coverage.setToolTip(file_activity_text(model.file_activity))
+        coverage.setStyleSheet('color:#bdbdbd; font-size:11px; padding:4px;')
+        layout.addWidget(coverage)
         self.tree = QTreeWidget()
-        self.tree.setAccessibleName('Processi segnalati e motivi')
-        self.tree.setHeaderLabels(['Stato','Processo','PID','Utente'])
-        self.tree.setColumnWidth(0,150)
-        self.tree.setColumnWidth(1,330)
-        self.tree.setColumnWidth(2,100)
+        self.tree.setAccessibleName('Processi, avvisi di sistema e motivi')
+        self.tree.setHeaderLabels(['Stato','Processo','PID','Utente','File'])
+        self.tree.setColumnWidth(0,130)
+        self.tree.setColumnWidth(1,200)
+        self.tree.setColumnWidth(2,80)
+        self.tree.setColumnWidth(3,110)
         self.tree.setWordWrap(True)
         rows = {(row['pid'],row['created']):row for group in model.rows for row in group.get('children',[group])}
         findings = sorted(model.threats.items(),key=lambda pair: (pair[1]['severity'] != 'alta',pair[0][0]))
         for identity,finding in findings:
             process = rows.get(identity,{})
             high = finding['severity'] == 'alta'
-            item = QTreeWidgetItem(['Sospetto' if high else 'Da verificare',process.get('name','Non disponibile'),str(finding['pid']),process.get('user') or 'N/D'])
+            path = program_file(process.get('exe'),process.get('cmdline'))
+            item = QTreeWidgetItem(['Sospetto' if high else 'Da verificare',process.get('name','Non disponibile'),str(finding['pid']),
+                                    process.get('user') or 'N/D',path])
+            item.setToolTip(4,path)
+            item.setToolTip(1,path)
             item.setForeground(0,QColor('#ff99a4' if high else '#f5c26b'))
             for reason in finding['reasons']:
                 child = QTreeWidgetItem([reason])
@@ -501,15 +534,42 @@ class ProcessAnomaliesDialog(QDialog):
             for index in range(item.childCount()):
                 item.child(index).setFirstColumnSpanned(True)
             item.setExpanded(True)
-        if not findings:
-            self.tree.addTopLevelItem(QTreeWidgetItem(['','Nessun processo segnalato nel campione attuale']))
+        for finding in sorted(model.system_threats,key=lambda f: f['severity'] != 'alta'):
+            high = finding['severity'] == 'alta'
+            item = QTreeWidgetItem(['Sospetto' if high else 'Da verificare','Avviso di sistema','—','—'])
+            item.setForeground(0,QColor('#ff99a4' if high else '#f5c26b'))
+            child = QTreeWidgetItem([finding['reason']])
+            child.setToolTip(0,finding['reason'])
+            item.addChild(child)
+            self.tree.addTopLevelItem(item)
+            child.setFirstColumnSpanned(True)
+            item.setExpanded(True)
+        if not findings and not model.system_threats:
+            self.tree.addTopLevelItem(QTreeWidgetItem(['','Nessuna anomalia segnalata nel campione attuale']))
         layout.addWidget(self.tree)
         close = QPushButton('Chiudi')
         close.clicked.connect(self.accept)
         layout.addWidget(close,0,Qt.AlignRight)
 
 
-NETWORK_KINDS = dict(destinazione='Destinazione',dga='Domini generati (DGA)',tunnel='Tunnel DNS',spike='Picco del dispositivo')
+NETWORK_KINDS = dict(destinazione='Destinazione',dga='Domini generati (DGA)',tunnel='Tunnel DNS',spike='Picco del dispositivo',idn='Dominio IDN')
+
+
+def network_subject(item):
+    """Show observed names; an IP alone does not prove it was used directly."""
+    subject = item['subject']
+    key = item.get('key')
+    if item.get('kind') != 'destinazione' or not key:
+        return subject
+    suffix = f' ({key})'
+    if subject.endswith(suffix):
+        return subject[:-len(suffix)]
+    if subject == key:
+        if item.get('reverse_name'):
+            return f"DNS inverso: {item['reverse_name']} (da verificare)"
+        port = key.rsplit(':',1)[-1]
+        return f'Destinazione non identificata (porta {port})' if port.isdigit() else 'Destinazione non identificata'
+    return subject
 
 
 class NetworkDialog(QDialog):
@@ -524,9 +584,11 @@ class NetworkDialog(QDialog):
         sources = ', '.join(name for key,name in (('capture','DNS e avvii di connessione'),('closes','byte per connessione'),('flows','connessioni lunghe'))
                             if features.get(key)) or 'nessuna'
         note = QLabel(('Baseline in costruzione (prime 24 ore): le destinazioni nuove non contano ancora. ' if network.get('learning') else '')
-            +'Punteggio 0–100 calcolato solo dal comportamento osservato su questo computer, senza elenchi di server malevoli: '
+            +'Punteggio 0–100 calcolato dal comportamento osservato su questo computer, senza elenchi di server malevoli: '
             'più indicatori indipendenti fanno salire il punteggio. Non è una diagnosi: ordina ciò che merita uno sguardo. '
-            f'Fonti attive: {sources}. Non visibili: contenuti cifrati, DNS cifrato (DoH/DoT), traffico QUIC/UDP.')
+            'I domini contattati con lettere non ASCII o Punycode ricevono un avviso anche senza traffico insolito. '
+            f'Fonti attive: {sources}. Non visibili: contenuti cifrati, DNS cifrato (DoH/DoT), traffico QUIC/UDP. '
+            'Un nome non identificato non indica necessariamente una connessione diretta a un IP.')
         note.setWordWrap(True)
         note.setStyleSheet('color:#bdbdbd; font-size:11px; padding:4px;')
         layout.addWidget(note)
@@ -537,7 +599,7 @@ class NetworkDialog(QDialog):
         tree.setColumnWidth(2,160)
         tree.setWordWrap(True)
         for item in sorted(network['anomalies'],key=lambda a: -a['score']):
-            row = QTreeWidgetItem([f"{item['score']:.0f}",item['subject'],NETWORK_KINDS.get(item['kind'],item['kind']),item.get('process') or '—'])
+            row = QTreeWidgetItem([f"{item['score']:.0f}",network_subject(item),NETWORK_KINDS.get(item['kind'],item['kind']),item.get('process') or '—'])
             color = QColor('#ff99a4' if item['score'] >= 70 else '#f5c26b' if item['score'] >= 40 else '#bdbdbd')
             for column in range(4):
                 row.setForeground(column,color)
